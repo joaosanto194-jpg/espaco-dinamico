@@ -33,9 +33,9 @@ class Usuario(Base):
   __tablename__ = "usuarios"
   id = Column(Integer, primary_key=True)
   nome = Column(String(100), nullable=False)
-  cpf = Column(String(14), unique=True, nullable=False)  # Login principal
+  cpf = Column(String(14), unique=True, nullable=False)
   senha_hash = Column(String(128), nullable=False)
-  perfil = Column(String(20), default="Admin")  # ex: Admin, Atendente
+  perfil = Column(String(20), default="Admin")
 
 
 class Responsavel(Base):
@@ -138,28 +138,23 @@ Base.metadata.create_all(engine)
 SessionLocal = sessionmaker(bind=engine)
 
 
-# --- FUNÇÕES AUXILIARES DE SEGURANÇA E FORMATAÇÃO ---
+# --- FUNÇÕES DE SEGURANÇA E UTILITÁRIOS ---
 def gerar_hash_senha(senha: str) -> str:
-  """Gera o hash SHA-256 da senha."""
   return hashlib.sha256(senha.encode("utf-8")).hexdigest()
 
 
 def limpar_cpf(cpf: str) -> str:
-  """Remove pontuações mantendo apenas os números do CPF."""
   return re.sub(r"\D", "", cpf)
 
 
 def criar_usuario_admin_padrao():
-  """Cria o usuário inicial Admin se nenhum usuário existir no banco."""
   db = SessionLocal()
   try:
     if db.query(Usuario).count() == 0:
-      cpf_padrao = "00000000000"
-      senha_padrao = "admin123"
       admin = Usuario(
           nome="Administrador Espaço Dinâmico",
-          cpf=cpf_padrao,
-          senha_hash=gerar_hash_senha(senha_padrao),
+          cpf="00000000000",
+          senha_hash=gerar_hash_senha("admin123"),
           perfil="Admin",
       )
       db.add(admin)
@@ -178,12 +173,9 @@ def calcular_idade(data_nasc):
   if not data_nasc:
     return "-"
   hoje = date.today()
-  idade = (
-      hoje.year
-      - data_nasc.year
-      - ((hoje.month, hoje.day) < (data_nasc.month, data_nasc.day))
+  return (
+      f"{hoje.year - data_nasc.year - ((hoje.month, hoje.day) < (data_nasc.month, data_nasc.day))} anos"
   )
-  return f"{idade} anos"
 
 
 def para_date_obj(data_str):
@@ -200,7 +192,7 @@ def get_img_as_base64(file):
   return ""
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=600)
 def carregar_aba_observacao_atendimento(url_sheets):
   try:
     if not url_sheets or "/d/" not in url_sheets:
@@ -210,13 +202,7 @@ def carregar_aba_observacao_atendimento(url_sheets):
     csv_url = (
         f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={aba_nome}"
     )
-    df = pd.read_csv(csv_url)
-    if df.empty or "Carimbo de data/hora" not in df.columns:
-      if "gid=" in url_sheets:
-        gid = url_sheets.split("gid=")[1].split("#")[0].split("&")[0]
-        csv_url_gid = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
-        df = pd.read_csv(csv_url_gid)
-    return df
+    return pd.read_csv(csv_url)
   except Exception:
     return None
 
@@ -224,54 +210,77 @@ def carregar_aba_observacao_atendimento(url_sheets):
 def filtrar_aluno_planilha(df_obs, nome_aluno):
   if df_obs is None or df_obs.empty:
     return pd.DataFrame()
-
   col_nome = next(
       (col for col in df_obs.columns if "nome" in col.lower()), None
   )
   if not col_nome:
     return pd.DataFrame()
-
-  termo_limpo = nome_aluno.strip().lower()
+  termo = nome_aluno.strip().lower()
   df_aluno = df_obs[
-      df_obs[col_nome].astype(str).str.strip().str.lower() == termo_limpo
+      df_obs[col_nome].astype(str).str.strip().str.lower() == termo
   ]
-
   if df_aluno.empty:
-    primeiro_nome = termo_limpo.split()[0]
     df_aluno = df_obs[
         df_obs[col_nome]
         .astype(str)
         .str.strip()
         .str.lower()
-        .str.contains(primeiro_nome, na=False)
+        .str.contains(termo.split()[0], na=False)
     ]
-
   return df_aluno
 
 
-# --- TELA DE LOGIN ---
-def renderizar_tela_login(session_db):
+# --- TELA DE LOGIN ELEGANTE ---
+def renderizar_tela_login(session_db, logo_path):
+  logo_base64 = get_img_as_base64(logo_path)
+
   st.markdown(
-      """
-        <div style="text-align: center; padding-top: 20px;">
-            <h2 style="color: #0369a1;">🔐 Acesso Restrito ao Sistema</h2>
-            <p style="color: #64748b;">Informe seu CPF e Senha para continuar</p>
-        </div>
+      f"""
+        <style>
+            .stApp {{
+                background-image: linear-gradient(rgba(255, 255, 255, 0.93), rgba(255, 255, 255, 0.93)), url("data:image/png;base64,{logo_base64}");
+                background-size: 350px;
+                background-position: center;
+                background-repeat: no-repeat;
+                background-attachment: fixed;
+            }}
+            .login-card {{
+                background: rgba(255, 255, 255, 0.98);
+                padding: 40px;
+                border-radius: 16px;
+                box-shadow: 0 10px 25px rgba(0,0,0,0.08);
+                border: 1px solid #e2e8f0;
+            }}
+        </style>
     """,
       unsafe_allow_html=True,
   )
 
-  col1, col2, col3 = st.columns([1, 2, 1])
-  with col2:
+  _, col_centro, _ = st.columns([1, 1.2, 1])
+  with col_centro:
+    st.markdown("<div style='height: 40px;'></div>", unsafe_allow_html=True)
+    if os.path.exists(logo_path):
+      st.image(logo_path, width=120)
+
+    st.markdown(
+        """
+            <h2 style='color: #0284c7; font-weight: 700; margin-bottom: 0px;'>Espaço Dinâmico</h2>
+            <p style='color: #64748b; font-size: 15px; margin-bottom: 25px;'>Sistema de Gestão Integrada</p>
+        """,
+        unsafe_allow_html=True,
+    )
+
     with st.form("form_login"):
       cpf_input = st.text_input("CPF (Apenas números)", max_chars=14)
       senha_input = st.text_input("Senha", type="password")
-      btn_login = st.form_submit_button("Entrar no Sistema", use_container_width=True)
+      btn_login = st.form_submit_button(
+          "Entrar no Sistema", use_container_width=True
+      )
 
       if btn_login:
         cpf_limpo = limpar_cpf(cpf_input)
         if not cpf_limpo or not senha_input:
-          st.error("Por favor, preencha o CPF e a Senha!")
+          st.error("Preencha o CPF e a Senha.")
         else:
           hash_senha = gerar_hash_senha(senha_input)
           usuario = (
@@ -286,12 +295,7 @@ def renderizar_tela_login(session_db):
             st.success(f"Bem-vindo(a), {usuario.nome}!")
             st.rerun()
           else:
-            st.error("CPF ou Senha incorretos!")
-
-    st.info(
-        "💡 **Primeiro Acesso (Credencial Inicial):**\n- **CPF:** `00000000000`\n-"
-        " **Senha:** `admin123`"
-    )
+            st.error("CPF ou Senha incorretos.")
 
 
 # --- APLICAÇÃO PRINCIPAL ---
@@ -302,114 +306,75 @@ def main():
   criar_usuario_admin_padrao()
 
   logo_path = "ABC DINÂMICO.png"
-  logo_base64 = get_img_as_base64(logo_path)
-
-  st.markdown(
-      f"""
-        <style>
-            .stApp {{
-                background-image: linear-gradient(rgba(255, 255, 255, 0.95), rgba(255, 255, 255, 0.95)), url("data:image/png;base64,{logo_base64}");
-                background-size: 400px;
-                background-position: center;
-                background-repeat: no-repeat;
-                background-attachment: fixed;
-            }}
-            @media print {{
-                body {{ background: white !important; }}
-                header, footer, nav, .stButton, .stRadio {{ display: none !important; }}
-            }}
-        </style>
-    """,
-      unsafe_allow_html=True,
-  )
-
   session_db = SessionLocal()
 
   try:
-    # --- MODO PORTAL DOS PAIS (Livre sem Login via Link do Aluno) ---
+    # --- PORTAL DOS PAIS ---
     aluno_url = st.query_params.get("aluno", None)
-
     if aluno_url:
-      col_logo, col_titulo = st.columns([1, 15])
-      with col_logo:
+      c_l, c_t = st.columns([1, 15])
+      with c_l:
         if os.path.exists(logo_path):
           st.image(logo_path, width=75)
-      with col_titulo:
+      with c_t:
         st.markdown(
-            "<h1 style='margin:0; color:#0369a1; font-size:30px;'>Espaço"
-            " Dinâmico</h1><h3 style='margin:0; color:#334155;"
-            " font-size:18px;'>Portal de Acompanhamento Familiar</h3>",
+            "<h1 style='margin:0; color:#0284c7; font-size:26px;'>Espaço"
+            " Dinâmico</h1><h3 style='margin:0; color:#475569;'><span"
+            " style='font-size:16px;'>Portal de Acompanhamento</span></h3>",
             unsafe_allow_html=True,
         )
 
       st.markdown("---")
       st.markdown(f"### 🌟 Relatório de Desenvolvimento: **{aluno_url}**")
-
       aluno_db = (
           session_db.query(Aluno)
           .filter(Aluno.nome.ilike(f"%{aluno_url}%"))
           .first()
       )
-      if aluno_db:
-        link_planilha = None
-        if (
-            aluno_db.desempenhos
-            and aluno_db.desempenhos[0].link_google_sheets
-        ):
-          link_planilha = aluno_db.desempenhos[0].link_google_sheets
-        else:
-          outro = (
-              session_db.query(DesempenhoPais)
-              .filter(DesempenhoPais.link_google_sheets.isnot(None))
-              .first()
+
+      if aluno_db and aluno_db.desempenhos and aluno_db.desempenhos[0].link_google_sheets:
+        df_obs = carregar_aba_observacao_atendimento(
+            aluno_db.desempenhos[0].link_google_sheets
+        )
+        df_aluno = filtrar_aluno_planilha(df_obs, aluno_url)
+        if not df_aluno.empty:
+          m1, m2 = st.columns(2)
+          m1.metric("Atendimentos", len(df_aluno))
+          m2.metric(
+              "Último Atendimento",
+              df_aluno.iloc[-1].get("Nº do atendimento", "-"),
           )
-          if outro:
-            link_planilha = outro.link_google_sheets
-
-        if link_planilha:
-          df_obs = carregar_aba_observacao_atendimento(link_planilha)
-          df_aluno = filtrar_aluno_planilha(df_obs, aluno_url)
-
-          if not df_aluno.empty:
-            m1, m2 = st.columns(2)
-            m1.metric("Atendimentos Realizados", len(df_aluno))
-            if "Nº do atendimento" in df_aluno.columns:
-              m2.metric(
-                  "Último Atendimento",
-                  df_aluno.iloc[-1].get("Nº do atendimento", "-"),
-              )
-
-            st.markdown("---")
-            st.dataframe(df_aluno, use_container_width=True)
-          else:
-            st.info("Nenhum registro publicado até o momento.")
+          st.markdown("---")
+          st.dataframe(df_aluno, use_container_width=True)
         else:
-          st.info("Planilha de acompanhamento ainda não vinculada.")
+          st.info("Nenhum registro publicado até o momento.")
       else:
-        st.warning("Aluno não localizado no sistema.")
+        st.info("Acompanhamento não configurado para este aluno.")
       return
 
-    # --- VERIFICAÇÃO DE LOGIN ADMINISTRATIVO ---
+    # --- VERIFICAÇÃO DE LOGIN ---
     if "usuario_logado" not in st.session_state:
-      renderizar_tela_login(session_db)
+      renderizar_tela_login(session_db, logo_path)
       return
 
-    # --- MODO ADMINISTRATIVO (AUTENTICADO) ---
-    col_logo, col_titulo, col_user = st.columns([1, 10, 4])
-    with col_logo:
+    # --- HEADER DO SISTEMA ---
+    col_l, col_t, col_u = st.columns([1, 11, 4])
+    with col_l:
       if os.path.exists(logo_path):
-        st.image(logo_path, width=75)
-    with col_titulo:
+        st.image(logo_path, width=70)
+    with col_t:
       st.markdown(
-          "<h1 style='margin:0; color:#1f2937; font-size:30px;'>Espaço"
-          " Dinâmico</h1><p style='margin:0; color:#4b5563;"
-          " font-size:14px;'>Sistema Integrado de Gestão"
-          " Neuropsicopedagógica</p>",
+          "<h1 style='margin:0; color:#1e293b; font-size:26px;'>Espaço"
+          " Dinâmico</h1><p style='margin:0; color:#64748b; font-size:13px;'>Sistema"
+          " Integrado de Gestão Neuropsicopedagógica</p>",
           unsafe_allow_html=True,
       )
-    with col_user:
-      st.write(f"👤 **{st.session_state['usuario_logado']}**")
-      if st.button("🚪 Sair / Logout"):
+    with col_u:
+      st.markdown(
+          f"<div style='text-align: right;'>👤 <b>{st.session_state['usuario_logado']}</b></div>",
+          unsafe_allow_html=True,
+      )
+      if st.button("🚪 Sair do Sistema", use_container_width=True):
         del st.session_state["usuario_logado"]
         st.rerun()
 
@@ -477,19 +442,10 @@ def main():
             nome_r = st.text_input("Nome Completo *")
             tel_r = st.text_input("WhatsApp / Telefone *")
             if st.form_submit_button("Salvar Responsável") and nome_r:
-              if (
-                  session_db.query(Responsavel)
-                  .filter(Responsavel.nome.ilike(nome_r.strip()))
-                  .first()
-              ):
-                st.error("Responsável já cadastrado!")
-              else:
-                session_db.add(
-                    Responsavel(nome=nome_r.strip(), telefone=tel_r)
-                )
-                session_db.commit()
-                st.toast("Responsável salvo com sucesso!", icon="✅")
-                st.rerun()
+              session_db.add(Responsavel(nome=nome_r.strip(), telefone=tel_r))
+              session_db.commit()
+              st.toast("Responsável salvo com sucesso!", icon="✅")
+              st.rerun()
 
         with col_a:
           responsaveis = session_db.query(Responsavel).all()
@@ -509,23 +465,16 @@ def main():
             r_id = resp_dict[r_sel] if r_sel else None
 
             if st.form_submit_button("Salvar Aluno") and nome_a:
-              if (
-                  session_db.query(Aluno)
-                  .filter(Aluno.nome.ilike(nome_a.strip()))
-                  .first()
-              ):
-                st.error("Aluno já cadastrado!")
-              else:
-                novo_a = Aluno(
-                    nome=nome_a.strip(),
-                    data_nascimento=para_date_obj(nasc_a),
-                    escolaridade=esc_a,
-                    responsavel_id=r_id,
-                )
-                session_db.add(novo_a)
-                session_db.commit()
-                st.toast("Aluno cadastrado!", icon="✅")
-                st.rerun()
+              novo_a = Aluno(
+                  nome=nome_a.strip(),
+                  data_nascimento=para_date_obj(nasc_a),
+                  escolaridade=esc_a,
+                  responsavel_id=r_id,
+              )
+              session_db.add(novo_a)
+              session_db.commit()
+              st.toast("Aluno cadastrado!", icon="✅")
+              st.rerun()
 
       with tab2:
         alunos = session_db.query(Aluno).all()
@@ -558,52 +507,80 @@ def main():
               session_db.commit()
               st.toast("Atualizado com sucesso!")
               st.rerun()
-
             if col_b2.form_submit_button("Excluir Aluno"):
               session_db.delete(aluno_edit)
               session_db.commit()
               st.toast("Aluno removido!")
               st.rerun()
 
-    # --- GERENCIAR USUÁRIOS ---
+    # --- GERENCIAR USUÁRIOS (COM ALTERAÇÃO DE SENHA E EXCLUSÃO) ---
     elif menu_opcao == "🔐 Gerenciar Usuários":
-      st.header("🔐 Cadastro de Novos Usuários do Sistema")
-      with st.form("f_novo_usuario"):
-        nome_u = st.text_input("Nome Completo *")
-        cpf_u = st.text_input("CPF (Apenas números) *", max_chars=14)
-        senha_u = st.text_input("Senha *", type="password")
-        perfil_u = st.selectbox("Perfil", ["Admin", "Atendente"])
+      st.header("🔐 Controle de Usuários e Acessos")
+      t_novo, t_gerenciar = st.tabs(
+          ["Cadastrar Novo Usuário", "Editar / Excluir Usuários"]
+      )
 
-        if st.form_submit_button("Cadastrar Usuário"):
-          cpf_limpo = limpar_cpf(cpf_u)
-          if not nome_u or not cpf_limpo or not senha_u:
-            st.error("Preencha todos os campos obrigatórios!")
-          elif (
-              session_db.query(Usuario)
-              .filter(Usuario.cpf == cpf_limpo)
-              .first()
-          ):
-            st.error("Já existe um usuário cadastrado com este CPF!")
-          else:
-            novo_usr = Usuario(
-                nome=nome_u.strip(),
-                cpf=cpf_limpo,
-                senha_hash=gerar_hash_senha(senha_u),
-                perfil=perfil_u,
+      with t_novo:
+        with st.form("f_novo_usuario"):
+          nome_u = st.text_input("Nome Completo *")
+          cpf_u = st.text_input("CPF (Apenas números) *", max_chars=14)
+          senha_u = st.text_input("Senha *", type="password")
+          perfil_u = st.selectbox("Perfil", ["Admin", "Atendente"])
+
+          if st.form_submit_button("Cadastrar Usuário"):
+            cpf_limpo = limpar_cpf(cpf_u)
+            if not nome_u or not cpf_limpo or not senha_u:
+              st.error("Preencha todos os campos obrigatórios.")
+            elif (
+                session_db.query(Usuario)
+                .filter(Usuario.cpf == cpf_limpo)
+                .first()
+            ):
+              st.error("Já existe usuário cadastrado com este CPF.")
+            else:
+              session_db.add(
+                  Usuario(
+                      nome=nome_u.strip(),
+                      cpf=cpf_limpo,
+                      senha_hash=gerar_hash_senha(senha_u),
+                      perfil=perfil_u,
+                  )
+              )
+              session_db.commit()
+              st.success("Usuário cadastrado com sucesso!")
+              st.rerun()
+
+      with t_gerenciar:
+        users = session_db.query(Usuario).all()
+        if users:
+          u_dict = {f"{u.nome} (CPF: {u.cpf})": u for u in users}
+          sel_u = st.selectbox("Selecione o Usuário", list(u_dict.keys()))
+          usr_obj = u_dict[sel_u]
+
+          with st.form("f_alt_usuario"):
+            st.subheader(f"Gerenciar: {usr_obj.nome}")
+            nova_senha = st.text_input(
+                "Nova Senha (deixe em branco para não alterar)", type="password"
             )
-            session_db.add(novo_usr)
-            session_db.commit()
-            st.success("Novo usuário cadastrado com sucesso!")
-            st.rerun()
 
-      st.markdown("### 👥 Usuários Cadastrados")
-      users = session_db.query(Usuario).all()
-      if users:
-        dados_u = [
-            {"ID": u.id, "Nome": u.nome, "CPF": u.cpf, "Perfil": u.perfil}
-            for u in users
-        ]
-        st.dataframe(pd.DataFrame(dados_u), use_container_width=True)
+            c_btn1, c_btn2 = st.columns(2)
+            if c_btn1.form_submit_button("Salvar Alteração de Senha"):
+              if nova_senha:
+                usr_obj.senha_hash = gerar_hash_senha(nova_senha)
+                session_db.commit()
+                st.success("Senha atualizada com sucesso!")
+                st.rerun()
+              else:
+                st.warning("Informe a nova senha.")
+
+            if c_btn2.form_submit_button("Excluir Usuário"):
+              if usr_obj.cpf == "00000000000":
+                st.error("Não é permitido excluir o Administrador padrão.")
+              else:
+                session_db.delete(usr_obj)
+                session_db.commit()
+                st.success("Usuário excluído com sucesso!")
+                st.rerun()
 
     # --- DESEMPENHO E SHEETS ---
     elif menu_opcao == "📈 Desempenho & Sheets":
@@ -635,21 +612,14 @@ def main():
                   )
               )
             session_db.commit()
-            st.toast("Link da planilha salvo!")
+            st.toast("Link salvo com sucesso!")
             st.rerun()
 
         st.markdown("---")
         st.subheader("🔗 Link de Acesso Exclusivo para os Pais")
-
         nome_enc = urllib.parse.quote(aluno_obj.nome)
         host_url = os.getenv("APP_URL", "http://localhost:8501")
-        link_pais = f"{host_url}/?aluno={nome_enc}"
-
-        st.code(link_pais, language="text")
-        st.caption(
-            "Envie este link para os pais via WhatsApp para que eles acompanhem"
-            " os relatórios."
-        )
+        st.code(f"{host_url}/?aluno={nome_enc}", language="text")
 
   finally:
     session_db.close()
