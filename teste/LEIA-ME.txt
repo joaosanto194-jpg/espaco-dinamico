@@ -1,0 +1,29 @@
+# Espaço Dinâmico — versão de teste
+
+## Arquivos
+- `app.py`: aplicação Streamlit atualizada.
+- `logo_espaco_dinamico.png`: logotipo fornecido.
+- `requirements.txt`: dependências.
+
+## Instalação local (Windows)
+1. Faça uma cópia de segurança do seu arquivo atual `espaco_dinamico.db` e do código anterior.
+2. Coloque os três arquivos desta entrega na mesma pasta do banco de dados atual.
+3. Abra o terminal nessa pasta e execute:
+   `python -m pip install -r requirements.txt`
+4. Execute: `streamlit run app.py`
+5. Se o banco estiver vazio, o acesso inicial de teste será CPF `00000000000` e senha `admin123`. Troque essa senha imediatamente.
+
+## Preservação do banco
+Por padrão, o aplicativo procura `espaco_dinamico.db` na mesma pasta do `app.py`. Se seu banco existente estiver em outro local, defina `DATABASE_URL` para apontar para ele antes de iniciar. Não apague nem substitua o banco original. Faça uma cópia de segurança antes do primeiro teste.
+
+## Sessão persistente
+A aplicação usa cookie de sessão com token aleatório guardado como hash no banco. A validade padrão é de 7 dias (`SESSION_DAYS`). Cookies dependem de um navegador que permita cookies e de uma URL consistente. Em publicação real, use HTTPS e segredo/credenciais configurados no ambiente.
+
+## Credenciais de primeiro acesso
+Antes de publicar, configure as variáveis `ADMIN_CPF` e `ADMIN_PASSWORD` no ambiente se o banco ainda não tiver usuários. A senha padrão `admin123` serve apenas para teste local e deve ser alterada. Usuários antigos continuam compatíveis: após login válido, o hash SHA-256 legado é atualizado para PBKDF2.
+
+## Observações importantes
+- Esta é uma versão inicial para teste prático, não uma auditoria de segurança ou certificação para produção.
+- O portal dos pais por nome na URL foi bloqueado temporariamente para evitar exposição de dados; precisa ser implementado com convite/token individual revogável.
+- O financeiro é um controle operacional inicial e não substitui sistema contábil/fiscal.
+- Antes de publicar, validar backup/restauração, permissões por perfil, HTTPS, proteção de segredos e regras de acesso a prontuários.
