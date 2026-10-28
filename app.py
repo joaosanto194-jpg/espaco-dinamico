@@ -396,10 +396,14 @@ def aplicar_estilo_global():
       div[data-testid="stMetricLabel"] { color:#64748b; }
       div[data-testid="stMetricValue"] { color:#142b4a; }
       .stAppViewBlockContainer, .main .block-container, [data-testid="stAppViewContainer"] .block-container {
-        padding-top: 3.25rem !important; padding-bottom: 2.5rem !important; overflow: visible !important;
+        padding-top: 1.25rem !important; padding-bottom: 2.5rem !important;
       }
-      [data-testid="stVerticalBlock"] { overflow: visible; }
-      .ed-header { display:flex; align-items:center; gap:22px; width:100%; min-height:108px; padding:18px 22px; margin:4px 0 18px 0; box-sizing:border-box; overflow:visible; background:linear-gradient(110deg,#ffffff 0%,#f8fbff 100%); border:1px solid #e5ebf3; border-radius:16px; box-shadow:0 5px 18px rgba(20,43,74,.045); }
+      /* O wrapper do Streamlit fica sticky; o restante da página continua rolando normalmente. */
+      div[data-testid="stMarkdown"]:has(.ed-header) {
+        position: sticky; top: 0.45rem; z-index: 1000; align-self: stretch;
+        background: #f4f7fb; padding-top: 0.15rem; padding-bottom: 0.25rem;
+      }
+      .ed-header { position:relative; top:auto; left:auto; right:auto; z-index:1; display:flex; align-items:center; gap:22px; width:100%; min-height:108px; padding:18px 22px; margin:0; box-sizing:border-box; overflow:visible; background:linear-gradient(110deg,rgba(255,255,255,.99) 0%,rgba(248,251,255,.99) 100%); border:1px solid #e5ebf3; border-radius:16px; box-shadow:0 8px 24px rgba(20,43,74,.12); }
       .ed-header-logo { flex:0 0 82px; display:flex; align-items:center; justify-content:center; }
       .ed-header-logo img { max-width:78px; max-height:78px; object-fit:contain; }
       .ed-header-title { flex:1 1 auto; min-width:0; padding:4px 0; }
@@ -408,7 +412,8 @@ def aplicar_estilo_global():
       .ed-profissional { flex:0 0 230px; text-align:right; padding:8px 0 8px 12px; min-height:68px; box-sizing:border-box; display:flex; flex-direction:column; justify-content:center; line-height:1.55; overflow:visible; border-left:1px solid #e2e8f0; }
       .ed-profissional strong { display:block; color:#142b4a; font-size:1.02rem; white-space:normal; overflow-wrap:anywhere; margin:0 0 3px 0; }
       .ed-profissional span { color:#64748b; font-size:.88rem; }
-      @media (max-width: 760px) { .ed-header { gap:12px; padding:15px; flex-wrap:wrap; } .ed-header-logo { flex-basis:60px; } .ed-header-logo img { max-width:58px; max-height:58px; } .ed-profissional { flex:1 1 100%; text-align:left; border-left:0; border-top:1px solid #e2e8f0; padding:10px 0 0 0; min-height:0; } }
+      @media (max-width: 900px) { div[data-testid="stMarkdown"]:has(.ed-header) { top:0; } .ed-header { gap:12px; padding:13px 15px; flex-wrap:wrap; } .ed-header-logo { flex-basis:60px; } .ed-header-logo img { max-width:58px; max-height:58px; } .ed-profissional { flex:1 1 100%; text-align:left; border-left:0; border-top:1px solid #e2e8f0; padding:8px 0 0 0; min-height:0; } }
+      @media (min-width: 901px) and (max-width: 1100px) { .ed-header { gap:12px; padding:15px; } .ed-profissional { flex-basis:190px; } }
       .stButton > button, .stFormSubmitButton > button { border-radius:9px; font-weight:600; min-height:2.55rem; }
       div[data-testid="stTabs"] button { font-weight:600; }
       [data-testid="stSidebar"] div.st-key-sair_sistema button { background:rgba(255,255,255,.10) !important; color:#fff !important; border:1px solid rgba(255,255,255,.28) !important; }
@@ -533,218 +538,369 @@ def tela_painel(db):
 
 def tela_cadastros(db):
     st.title("Alunos e responsáveis")
-    tab1, tab2, tab3 = st.tabs(["Cadastrar responsável", "Cadastrar aluno", "Gerenciar cadastros"])
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "➕ Cadastrar responsável", "➕ Cadastrar aluno", "✏️ Gerenciar alunos", "👥 Gerenciar responsáveis"
+    ])
+
     with tab1:
         with st.form("f_resp", clear_on_submit=True):
             nome = st.text_input("Nome completo *")
             telefone = st.text_input("Telefone / WhatsApp")
             email = st.text_input("E-mail")
-            if st.form_submit_button("Salvar responsável", type="primary"):
-                if not nome.strip():
-                    st.error("Informe o nome do responsável.")
-                else:
-                    try:
-                        db.add(Responsavel(nome=nome.strip(), telefone=telefone.strip(), email=email.strip()))
-                        db.commit()
-                        st.success("Responsável cadastrado.")
-                        st.rerun()
-                    except IntegrityError:
-                        db.rollback()
-                        st.error("Já existe um responsável com esse nome.")
-                    except SQLAlchemyError as exc:
-                        db.rollback()
-                        mensagem_erro(exc, "cadastro do responsável")
+            salvar_resp = st.form_submit_button("Salvar responsável", type="primary")
+        if salvar_resp:
+            if not nome.strip():
+                st.error("Informe o nome do responsável.")
+            else:
+                try:
+                    db.add(Responsavel(nome=nome.strip(), telefone=telefone.strip(), email=email.strip()))
+                    db.commit()
+                    st.success("Responsável cadastrado.")
+                    st.rerun()
+                except IntegrityError:
+                    db.rollback()
+                    st.error("Já existe um responsável com esse nome.")
+                except SQLAlchemyError as exc:
+                    db.rollback()
+                    mensagem_erro(exc, "cadastro do responsável")
+
     with tab2:
         responsaveis = db.query(Responsavel).order_by(Responsavel.nome).all()
-        mapa = {f"{r.id} — {r.nome}": r.id for r in responsaveis}
+        mapa_resp = {f"{r.id} — {r.nome}": r.id for r in responsaveis}
         with st.form("f_aluno", clear_on_submit=True):
-            nome = st.text_input("Nome completo do aluno *")
-            nasc = st.date_input("Data de nascimento", value=None, min_value=date(1900,1,1), max_value=date.today(), format="DD/MM/YYYY")
+            nome_aluno = st.text_input("Nome completo do aluno *")
+            nasc = st.date_input("Data de nascimento", value=None, min_value=date(1900, 1, 1), max_value=date.today(), format="DD/MM/YYYY")
             escolaridade = st.text_input("Escolaridade")
-            resp_sel = st.selectbox("Responsável", ["Não informado"] + list(mapa.keys()))
-            if st.form_submit_button("Salvar aluno", type="primary"):
-                if not nome.strip():
-                    st.error("Informe o nome do aluno.")
-                else:
-                    try:
-                        db.add(Aluno(nome=nome.strip(), data_nascimento=nasc,
-                                     escolaridade=escolaridade.strip(),
-                                     responsavel_id=mapa.get(resp_sel), ativo=1))
-                        db.commit()
-                        st.success("Aluno cadastrado.")
-                        st.rerun()
-                    except SQLAlchemyError as exc:
-                        db.rollback()
-                        mensagem_erro(exc, "cadastro do aluno")
+            resp_sel = st.selectbox("Responsável", ["Não informado"] + list(mapa_resp.keys()))
+            salvar_aluno = st.form_submit_button("Salvar aluno", type="primary")
+        if salvar_aluno:
+            if not nome_aluno.strip():
+                st.error("Informe o nome do aluno.")
+            else:
+                try:
+                    db.add(Aluno(nome=nome_aluno.strip(), data_nascimento=nasc,
+                                 escolaridade=escolaridade.strip(), responsavel_id=mapa_resp.get(resp_sel), ativo=1))
+                    db.commit()
+                    st.success("Aluno cadastrado.")
+                    st.rerun()
+                except SQLAlchemyError as exc:
+                    db.rollback()
+                    mensagem_erro(exc, "cadastro do aluno")
+
     with tab3:
         alunos = db.query(Aluno).order_by(Aluno.nome).all()
         if not alunos:
             st.info("Não há alunos cadastrados.")
         else:
-            mapa = {f"{a.id} — {a.nome}{'' if a.ativo else ' (inativo)'}": a.id for a in alunos}
-            selecionado = st.selectbox("Selecione um aluno", list(mapa.keys()))
-            aluno = db.get(Aluno, mapa[selecionado])
-            with st.form("f_editar_aluno"):
-                nome = st.text_input("Nome", value=aluno.nome)
-                nasc = st.date_input("Nascimento", value=aluno.data_nascimento or date.today(), min_value=date(1900,1,1), max_value=date.today(), format="DD/MM/YYYY")
-                escolaridade = st.text_input("Escolaridade", value=aluno.escolaridade or "")
-                resp_map = {"Não informado": None}
-                resp_map.update({f"{r.id} — {r.nome}": r.id for r in db.query(Responsavel).order_by(Responsavel.nome).all()})
-                atual_resp = next((k for k,v in resp_map.items() if v == aluno.responsavel_id), "Não informado")
-                resp_sel = st.selectbox("Responsável", list(resp_map.keys()), index=list(resp_map.keys()).index(atual_resp))
-                ativo = st.checkbox("Aluno ativo", value=bool(aluno.ativo))
-                salvar = st.form_submit_button("Salvar alterações", type="primary")
-            if salvar:
-                if not nome.strip():
+            mapa_alunos = {f"{a.id} — {a.nome}{'' if a.ativo else ' (inativo)'}": a.id for a in alunos}
+            escolha = st.selectbox("Selecione o aluno para editar", list(mapa_alunos), key="gerenciar_aluno_sel")
+            aluno = db.get(Aluno, mapa_alunos[escolha])
+            responsaveis = db.query(Responsavel).order_by(Responsavel.nome).all()
+            resp_map = {"Não informado": None}
+            resp_map.update({f"{r.id} — {r.nome}": r.id for r in responsaveis})
+            atual_resp = next((k for k, v in resp_map.items() if v == aluno.responsavel_id), "Não informado")
+            with st.form(f"f_editar_aluno_{aluno.id}"):
+                nome_edit = st.text_input("Nome", value=aluno.nome)
+                nasc_edit = st.date_input("Nascimento", value=aluno.data_nascimento or date.today(), min_value=date(1900, 1, 1), max_value=date.today(), format="DD/MM/YYYY")
+                esc_edit = st.text_input("Escolaridade", value=aluno.escolaridade or "")
+                resp_edit = st.selectbox("Responsável", list(resp_map), index=list(resp_map).index(atual_resp))
+                ativo_edit = st.checkbox("Aluno ativo", value=bool(aluno.ativo))
+                salvar_edit = st.form_submit_button("Salvar alterações", type="primary")
+            if salvar_edit:
+                if not nome_edit.strip():
+                    st.error("O nome do aluno é obrigatório.")
+                else:
+                    try:
+                        aluno.nome = nome_edit.strip()
+                        aluno.data_nascimento = nasc_edit
+                        aluno.escolaridade = esc_edit.strip()
+                        aluno.responsavel_id = resp_map[resp_edit]
+                        aluno.ativo = 1 if ativo_edit else 0
+                        db.commit()
+                        st.success("Cadastro do aluno atualizado.")
+                        st.rerun()
+                    except SQLAlchemyError as exc:
+                        db.rollback()
+                        mensagem_erro(exc, "edição do aluno")
+            st.caption("A inativação preserva prontuários, contratos, atividades e lançamentos vinculados.")
+            if aluno.ativo:
+                if st.button("Inativar aluno", key=f"inativar_aluno_{aluno.id}"):
+                    aluno.ativo = 0
+                    db.commit()
+                    st.success("Aluno inativado; histórico preservado.")
+                    st.rerun()
+            else:
+                if st.button("Reativar aluno", key=f"reativar_aluno_{aluno.id}"):
+                    aluno.ativo = 1
+                    db.commit()
+                    st.success("Aluno reativado.")
+                    st.rerun()
+
+    with tab4:
+        responsaveis = db.query(Responsavel).order_by(Responsavel.nome).all()
+        if not responsaveis:
+            st.info("Não há responsáveis cadastrados.")
+        else:
+            st.dataframe(pd.DataFrame([{
+                "ID": r.id, "Nome": r.nome, "Telefone": r.telefone or "", "E-mail": r.email or "",
+                "Alunos vinculados": len(r.alunos)
+            } for r in responsaveis]), use_container_width=True, hide_index=True)
+            mapa_r = {f"{r.id} — {r.nome}": r.id for r in responsaveis}
+            escolha_r = st.selectbox("Selecione o responsável para editar", list(mapa_r), key="gerenciar_resp_sel")
+            responsavel = db.get(Responsavel, mapa_r[escolha_r])
+            with st.form(f"f_editar_resp_{responsavel.id}"):
+                nome_r = st.text_input("Nome completo", value=responsavel.nome)
+                telefone_r = st.text_input("Telefone / WhatsApp", value=responsavel.telefone or "")
+                email_r = st.text_input("E-mail", value=responsavel.email or "")
+                salvar_r = st.form_submit_button("Salvar responsável", type="primary")
+            if salvar_r:
+                if not nome_r.strip():
                     st.error("O nome é obrigatório.")
                 else:
-                    aluno.nome = nome.strip()
-                    aluno.data_nascimento = nasc
-                    aluno.escolaridade = escolaridade.strip()
-                    aluno.responsavel_id = resp_map[resp_sel]
-                    aluno.ativo = 1 if ativo else 0
-                    db.commit()
-                    st.success("Cadastro atualizado.")
-                    st.rerun()
-            st.caption("Por segurança, os registros são inativados em vez de excluídos, preservando vínculos e histórico.")
-            if st.button("Inativar aluno", key=f"inativar_{aluno.id}", disabled=not bool(aluno.ativo)):
-                aluno.ativo = 0
-                db.commit()
-                st.success("Aluno inativado; o histórico foi preservado.")
-                st.rerun()
-
+                    try:
+                        responsavel.nome = nome_r.strip()
+                        responsavel.telefone = telefone_r.strip()
+                        responsavel.email = email_r.strip()
+                        db.commit()
+                        st.success("Responsável atualizado.")
+                        st.rerun()
+                    except IntegrityError:
+                        db.rollback()
+                        st.error("Já existe outro responsável com esse nome.")
+                    except SQLAlchemyError as exc:
+                        db.rollback()
+                        mensagem_erro(exc, "edição do responsável")
+            if responsavel.alunos:
+                st.info("Este responsável possui aluno(s) vinculado(s). Para preservar o histórico, a exclusão física não é disponibilizada.")
+            else:
+                st.warning("Este responsável não possui alunos vinculados. A exclusão física é irreversível.")
+                confirmar = st.checkbox("Confirmo que desejo excluir permanentemente este responsável", key=f"conf_excluir_resp_{responsavel.id}")
+                if st.button("Excluir responsável", key=f"excluir_resp_{responsavel.id}", disabled=not confirmar):
+                    try:
+                        db.delete(responsavel)
+                        db.commit()
+                        st.success("Responsável excluído.")
+                        st.rerun()
+                    except SQLAlchemyError as exc:
+                        db.rollback()
+                        mensagem_erro(exc, "exclusão do responsável")
 
 def tela_contratos(db):
     st.title("Contratos e mensalidades")
     alunos = db.query(Aluno).filter_by(ativo=1).order_by(Aluno.nome).all()
     mapa = {f"{a.id} — {a.nome}": a.id for a in alunos}
-    tab1, tab2 = st.tabs(["Novo contrato", "Gerenciar contratos"])
+    tab1, tab2 = st.tabs(["➕ Novo contrato", "✏️ Consultar e gerenciar contratos"])
     with tab1:
         if not mapa:
-            st.info("Cadastre um aluno antes de criar um contrato.")
+            st.info("Cadastre um aluno ativo antes de criar um contrato.")
         else:
             with st.form("f_contrato", clear_on_submit=True):
-                aluno_label = st.selectbox("Aluno", list(mapa.keys()))
+                aluno_label = st.selectbox("Aluno", list(mapa))
                 servico = st.text_input("Descrição do serviço", "Intervenção Neuropsicopedagógica")
                 valor = st.number_input("Mensalidade (R$)", min_value=0.0, value=350.0, step=25.0)
                 vencimento = st.number_input("Dia de vencimento", min_value=1, max_value=31, value=10)
                 inicio = st.date_input("Data de início", value=date.today(), format="DD/MM/YYYY")
-                if st.form_submit_button("Criar contrato", type="primary"):
-                    if not servico.strip():
-                        st.error("Informe a descrição do serviço.")
-                    else:
+                criar = st.form_submit_button("Criar contrato", type="primary")
+            if criar:
+                if not servico.strip():
+                    st.error("Informe a descrição do serviço.")
+                else:
+                    try:
                         db.add(Contrato(aluno_id=mapa[aluno_label], descricao_servico=servico.strip(),
-                                        valor_mensalidade=valor, dia_vencimento=int(vencimento),
-                                        data_inicio=inicio, status="Ativo"))
+                                        valor_mensalidade=valor, dia_vencimento=int(vencimento), data_inicio=inicio, status="Ativo"))
                         db.commit()
                         st.success("Contrato criado.")
                         st.rerun()
+                    except SQLAlchemyError as exc:
+                        db.rollback()
+                        mensagem_erro(exc, "criação do contrato")
     with tab2:
         contratos = db.query(Contrato).order_by(Contrato.id.desc()).all()
-        if contratos:
-            cmap = {f"{c.id} — {c.aluno.nome if c.aluno else 'Aluno removido'} — {c.status}": c.id for c in contratos}
-            sel = st.selectbox("Selecione o contrato", list(cmap.keys()))
-            contrato = db.get(Contrato, cmap[sel])
-            with st.form("f_editar_contrato"):
-                servico = st.text_input("Serviço", value=contrato.descricao_servico or "")
-                valor = st.number_input("Mensalidade (R$)", min_value=0.0, value=float(contrato.valor_mensalidade or 0), step=25.0)
-                venc = st.number_input("Dia de vencimento", min_value=1, max_value=31, value=int(contrato.dia_vencimento or 10))
-                status = st.selectbox("Situação", ["Ativo", "Suspenso", "Encerrado"], index=["Ativo", "Suspenso", "Encerrado"].index(contrato.status if contrato.status in ["Ativo","Suspenso","Encerrado"] else "Ativo"))
-                salvar = st.form_submit_button("Salvar contrato", type="primary")
-            if salvar:
-                contrato.descricao_servico = servico.strip()
-                contrato.valor_mensalidade = valor
-                contrato.dia_vencimento = int(venc)
-                contrato.status = status
-                db.commit()
-                st.success("Contrato atualizado.")
-                st.rerun()
-            st.dataframe(pd.DataFrame([{
-                "ID": c.id, "Aluno": c.aluno.nome if c.aluno else "-",
-                "Serviço": c.descricao_servico, "Mensalidade": moeda(c.valor_mensalidade),
-                "Vencimento": f"Dia {c.dia_vencimento}", "Status": c.status,
-            } for c in contratos]), use_container_width=True, hide_index=True)
-        else:
+        if not contratos:
             st.info("Nenhum contrato cadastrado.")
-
+            return
+        st.dataframe(pd.DataFrame([{
+            "ID": c.id, "Aluno": c.aluno.nome if c.aluno else "Aluno não localizado",
+            "Serviço": c.descricao_servico or "", "Mensalidade": moeda(c.valor_mensalidade),
+            "Vencimento": f"Dia {c.dia_vencimento}", "Início": para_str_br(c.data_inicio), "Status": c.status
+        } for c in contratos]), use_container_width=True, hide_index=True)
+        cmap = {f"{c.id} — {c.aluno.nome if c.aluno else 'Aluno não localizado'} — {c.status}": c.id for c in contratos}
+        selecionado = st.selectbox("Selecione o contrato para editar", list(cmap), key="contrato_editar_sel")
+        contrato = db.get(Contrato, cmap[selecionado])
+        with st.form(f"f_editar_contrato_{contrato.id}"):
+            servico_e = st.text_input("Serviço", value=contrato.descricao_servico or "")
+            valor_e = st.number_input("Mensalidade (R$)", min_value=0.0, value=float(contrato.valor_mensalidade or 0), step=25.0)
+            venc_e = st.number_input("Dia de vencimento", min_value=1, max_value=31, value=int(contrato.dia_vencimento or 10))
+            status_opcoes = ["Ativo", "Suspenso", "Encerrado"]
+            status_atual = contrato.status if contrato.status in status_opcoes else "Ativo"
+            status_e = st.selectbox("Situação", status_opcoes, index=status_opcoes.index(status_atual))
+            salvar_e = st.form_submit_button("Salvar alterações", type="primary")
+        if salvar_e:
+            if not servico_e.strip():
+                st.error("Informe a descrição do serviço.")
+            else:
+                contrato.descricao_servico = servico_e.strip()
+                contrato.valor_mensalidade = float(valor_e)
+                contrato.dia_vencimento = int(venc_e)
+                contrato.status = status_e
+                try:
+                    db.commit()
+                    st.success("Contrato atualizado.")
+                    st.rerun()
+                except SQLAlchemyError as exc:
+                    db.rollback()
+                    mensagem_erro(exc, "edição do contrato")
+        st.caption("Para preservar o histórico financeiro, contratos não são apagados: use o status Encerrado.")
 
 def tela_prontuario(db):
     st.title("Prontuários e evolução")
     alunos = db.query(Aluno).filter_by(ativo=1).order_by(Aluno.nome).all()
     if not alunos:
-        st.info("Cadastre um aluno antes de registrar uma evolução.")
+        st.info("Cadastre um aluno ativo antes de registrar uma evolução.")
         return
     mapa = {f"{a.id} — {a.nome}": a.id for a in alunos}
-    sel = st.selectbox("Aluno", list(mapa.keys()), key="prontuario_aluno")
-    aluno_id = mapa[sel]
-    with st.form("f_prontuario", clear_on_submit=True):
-        data_reg = st.date_input("Data do registro", value=date.today(), format="DD/MM/YYYY")
-        queixa = st.text_area("Queixa principal / observações")
-        hipotese = st.text_area("Hipóteses / aspectos em investigação")
-        conduta = st.text_area("Conduta / intervenção realizada")
-        if st.form_submit_button("Salvar evolução", type="primary"):
+    aluno_label = st.selectbox("Aluno", list(mapa), key="prontuario_aluno")
+    aluno_id = mapa[aluno_label]
+    tab1, tab2 = st.tabs(["➕ Nova evolução", "📚 Consultar e editar histórico"])
+    with tab1:
+        with st.form("f_prontuario_novo", clear_on_submit=True):
+            data_reg = st.date_input("Data do registro", value=date.today(), format="DD/MM/YYYY")
+            queixa = st.text_area("Queixa principal / observações")
+            hipotese = st.text_area("Hipóteses / aspectos em investigação")
+            conduta = st.text_area("Conduta / intervenção realizada")
+            salvar = st.form_submit_button("Salvar evolução", type="primary")
+        if salvar:
             if not any([queixa.strip(), hipotese.strip(), conduta.strip()]):
                 st.error("Preencha pelo menos um campo antes de salvar.")
             else:
-                db.add(Prontuario(aluno_id=aluno_id, data_registro=data_reg,
-                                  queixa_principal=queixa.strip(),
-                                  hipotese_diagnostica=hipotese.strip(),
-                                  conduta=conduta.strip()))
-                db.commit()
-                st.success("Registro salvo.")
-                st.rerun()
-    registros = db.query(Prontuario).filter_by(aluno_id=aluno_id).order_by(Prontuario.data_registro.desc(), Prontuario.id.desc()).all()
-    st.subheader("Histórico")
-    if registros:
-        for p in registros:
-            with st.expander(f"Registro #{p.id} · {para_str_br(p.data_registro)}"):
-                st.write("**Queixa / observações**")
-                st.write(p.queixa_principal or "—")
-                st.write("**Hipóteses / aspectos em investigação**")
-                st.write(p.hipotese_diagnostica or "—")
-                st.write("**Conduta / intervenção**")
-                st.write(p.conduta or "—")
-    else:
-        st.info("Nenhuma evolução registrada para este aluno.")
-
+                try:
+                    db.add(Prontuario(aluno_id=aluno_id, data_registro=data_reg,
+                                      queixa_principal=queixa.strip(), hipotese_diagnostica=hipotese.strip(), conduta=conduta.strip()))
+                    db.commit()
+                    st.success("Registro salvo.")
+                    st.rerun()
+                except SQLAlchemyError as exc:
+                    db.rollback()
+                    mensagem_erro(exc, "salvamento da evolução")
+    with tab2:
+        registros = db.query(Prontuario).filter_by(aluno_id=aluno_id).order_by(Prontuario.data_registro.desc(), Prontuario.id.desc()).all()
+        if not registros:
+            st.info("Nenhuma evolução registrada para este aluno.")
+        else:
+            st.dataframe(pd.DataFrame([{
+                "ID": p.id, "Data": para_str_br(p.data_registro),
+                "Queixa / observações": p.queixa_principal or "", "Hipóteses": p.hipotese_diagnostica or "", "Conduta": p.conduta or ""
+            } for p in registros]), use_container_width=True, hide_index=True)
+            mapa_p = {f"Registro #{p.id} — {para_str_br(p.data_registro)}": p.id for p in registros}
+            escolha_p = st.selectbox("Selecione a evolução para editar", list(mapa_p), key=f"prontuario_editar_{aluno_id}")
+            p = db.get(Prontuario, mapa_p[escolha_p])
+            with st.form(f"f_editar_prontuario_{p.id}"):
+                data_e = st.date_input("Data do registro", value=p.data_registro or date.today(), format="DD/MM/YYYY")
+                queixa_e = st.text_area("Queixa principal / observações", value=p.queixa_principal or "")
+                hipotese_e = st.text_area("Hipóteses / aspectos em investigação", value=p.hipotese_diagnostica or "")
+                conduta_e = st.text_area("Conduta / intervenção realizada", value=p.conduta or "")
+                salvar_e = st.form_submit_button("Salvar alterações", type="primary")
+            if salvar_e:
+                if not any([queixa_e.strip(), hipotese_e.strip(), conduta_e.strip()]):
+                    st.error("O registro precisa conter pelo menos um campo preenchido.")
+                else:
+                    p.data_registro = data_e
+                    p.queixa_principal = queixa_e.strip()
+                    p.hipotese_diagnostica = hipotese_e.strip()
+                    p.conduta = conduta_e.strip()
+                    try:
+                        db.commit()
+                        st.success("Evolução atualizada.")
+                        st.rerun()
+                    except SQLAlchemyError as exc:
+                        db.rollback()
+                        mensagem_erro(exc, "edição da evolução")
+            st.warning("Prontuários são registros históricos sensíveis. A exclusão física não é disponibilizada nesta tela; corrija o conteúdo mantendo o histórico no sistema.")
 
 def tela_atividades(db):
     st.title("Atividades pedagógicas")
-    alunos = db.query(Aluno).filter_by(ativo=1).order_by(Aluno.nome).all()
+    alunos = db.query(Aluno).order_by(Aluno.nome).all()
     if not alunos:
         st.info("Cadastre um aluno antes de registrar atividades.")
         return
-    mapa = {f"{a.id} — {a.nome}": a.id for a in alunos}
-    with st.form("f_atividade", clear_on_submit=True):
-        aluno_sel = st.selectbox("Aluno", list(mapa.keys()))
-        titulo = st.text_input("Título da atividade *")
-        categoria = st.selectbox("Categoria", ["Intervenção", "Leitura", "Escrita", "Matemática", "Atenção", "Memória", "Outro"])
-        data_atividade = st.date_input("Data", value=date.today(), format="DD/MM/YYYY")
-        descricao = st.text_area("Descrição / objetivo / observações")
-        status = st.selectbox("Situação", ["Planejada", "Realizada", "Reagendada", "Cancelada"])
-        if st.form_submit_button("Salvar atividade", type="primary"):
-            if not titulo.strip():
-                st.error("Informe o título da atividade.")
-            else:
-                db.add(AtividadeAluno(aluno_id=mapa[aluno_sel], titulo=titulo.strip(),
-                                      categoria=categoria, data_atividade=data_atividade,
-                                      descricao=descricao.strip(), status=status))
-                db.commit()
-                st.success("Atividade registrada.")
-                st.rerun()
-    registros = db.query(AtividadeAluno).order_by(AtividadeAluno.data_atividade.desc()).all()
-    if registros:
-        filtro = st.selectbox("Filtrar por aluno", ["Todos"] + list(mapa.keys()), key="filtro_atividades")
-        if filtro != "Todos":
-            registros = [r for r in registros if r.aluno_id == mapa[filtro]]
+    mapa = {f"{a.id} — {a.nome}{'' if a.ativo else ' (inativo)'}": a.id for a in alunos}
+    categorias = ["Intervenção", "Leitura", "Escrita", "Matemática", "Atenção", "Memória", "Outro"]
+    status_opcoes = ["Planejada", "Realizada", "Reagendada", "Cancelada"]
+    tab1, tab2 = st.tabs(["➕ Nova atividade", "✏️ Consultar e gerenciar atividades"])
+    with tab1:
+        alunos_ativos = {k: v for k, v in mapa.items() if db.get(Aluno, v).ativo}
+        if not alunos_ativos:
+            st.info("Não há alunos ativos para vincular à nova atividade.")
+        else:
+            with st.form("f_atividade_nova", clear_on_submit=True):
+                aluno_sel = st.selectbox("Aluno", list(alunos_ativos))
+                titulo = st.text_input("Título da atividade *")
+                categoria = st.selectbox("Categoria", categorias)
+                data_atividade = st.date_input("Data", value=date.today(), format="DD/MM/YYYY")
+                descricao = st.text_area("Descrição / objetivo / observações")
+                status = st.selectbox("Situação", status_opcoes, index=1)
+                salvar = st.form_submit_button("Salvar atividade", type="primary")
+            if salvar:
+                if not titulo.strip():
+                    st.error("Informe o título da atividade.")
+                else:
+                    try:
+                        db.add(AtividadeAluno(aluno_id=alunos_ativos[aluno_sel], titulo=titulo.strip(), categoria=categoria,
+                                              data_atividade=data_atividade, descricao=descricao.strip(), status=status))
+                        db.commit()
+                        st.success("Atividade registrada.")
+                        st.rerun()
+                    except SQLAlchemyError as exc:
+                        db.rollback()
+                        mensagem_erro(exc, "cadastro da atividade")
+    with tab2:
+        registros = db.query(AtividadeAluno).order_by(AtividadeAluno.data_atividade.desc(), AtividadeAluno.id.desc()).all()
+        if not registros:
+            st.info("Nenhuma atividade registrada.")
+            return
+        filtro_aluno = st.selectbox("Filtrar por aluno", ["Todos"] + list(mapa), key="filtro_atividades_aluno")
+        filtro_status = st.selectbox("Filtrar situação", ["Todas"] + status_opcoes, key="filtro_atividades_status")
+        filtrados = registros
+        if filtro_aluno != "Todos":
+            filtrados = [r for r in filtrados if r.aluno_id == mapa[filtro_aluno]]
+        if filtro_status != "Todas":
+            filtrados = [r for r in filtrados if r.status == filtro_status]
         st.dataframe(pd.DataFrame([{
-            "ID": r.id, "Aluno": r.aluno.nome if r.aluno else "-",
-            "Data": para_str_br(r.data_atividade), "Título": r.titulo,
-            "Categoria": r.categoria, "Situação": r.status, "Descrição": r.descricao or "",
-        } for r in registros]), use_container_width=True, hide_index=True)
-    else:
-        st.info("Nenhuma atividade registrada.")
-
+            "ID": r.id, "Aluno": r.aluno.nome if r.aluno else "-", "Data": para_str_br(r.data_atividade),
+            "Título": r.titulo, "Categoria": r.categoria, "Situação": r.status, "Descrição": r.descricao or ""
+        } for r in filtrados]), use_container_width=True, hide_index=True)
+        if filtrados:
+            mapa_ativ = {f"#{r.id} — {r.aluno.nome if r.aluno else '-'} — {r.titulo} — {para_str_br(r.data_atividade)}": r.id for r in filtrados}
+            escolha = st.selectbox("Selecione a atividade para editar", list(mapa_ativ), key="atividade_editar_sel")
+            atividade = db.get(AtividadeAluno, mapa_ativ[escolha])
+            with st.form(f"f_editar_atividade_{atividade.id}"):
+                aluno_e = st.selectbox("Aluno", list(mapa), index=list(mapa.values()).index(atividade.aluno_id))
+                titulo_e = st.text_input("Título", value=atividade.titulo)
+                cat_atual = atividade.categoria if atividade.categoria in categorias else "Outro"
+                cat_e = st.selectbox("Categoria", categorias, index=categorias.index(cat_atual))
+                data_e = st.date_input("Data", value=atividade.data_atividade or date.today(), format="DD/MM/YYYY")
+                desc_e = st.text_area("Descrição / objetivo / observações", value=atividade.descricao or "")
+                st_atual = atividade.status if atividade.status in status_opcoes else "Planejada"
+                status_e = st.selectbox("Situação", status_opcoes, index=status_opcoes.index(st_atual))
+                salvar_e = st.form_submit_button("Salvar alterações", type="primary")
+            if salvar_e:
+                if not titulo_e.strip():
+                    st.error("O título é obrigatório.")
+                else:
+                    atividade.aluno_id = mapa[aluno_e]
+                    atividade.titulo = titulo_e.strip()
+                    atividade.categoria = cat_e
+                    atividade.data_atividade = data_e
+                    atividade.descricao = desc_e.strip()
+                    atividade.status = status_e
+                    try:
+                        db.commit()
+                        st.success("Atividade atualizada.")
+                        st.rerun()
+                    except SQLAlchemyError as exc:
+                        db.rollback()
+                        mensagem_erro(exc, "edição da atividade")
+            st.caption("Para preservar o histórico, use a situação Cancelada em vez de excluir definitivamente uma atividade.")
 
 def tela_desempenho(db):
     st.title("Desempenho e planilha mestre")
@@ -892,63 +1048,95 @@ def tela_desempenho(db):
 
 def tela_financeiro(db):
     st.title("Financeiro — lançamentos")
-    alunos = db.query(Aluno).filter_by(ativo=1).order_by(Aluno.nome).all()
+    alunos = db.query(Aluno).order_by(Aluno.nome).all()
     mapa = {"Sem vínculo com aluno": None}
-    mapa.update({f"{a.id} — {a.nome}": a.id for a in alunos})
-    with st.form("f_financeiro", clear_on_submit=True):
-        tipo = st.selectbox("Tipo", ["Receita", "Despesa"])
-        descricao = st.text_input("Descrição *")
-        categoria = st.selectbox("Categoria", ["Mensalidade", "Atendimento", "Material", "Aluguel", "Serviços", "Impostos", "Transporte", "Outro"])
-        valor = st.number_input("Valor (R$)", min_value=0.01, value=100.0, step=10.0)
-        vencimento = st.date_input("Data de vencimento", value=date.today(), format="DD/MM/YYYY")
-        aluno_label = st.selectbox("Aluno (opcional)", list(mapa.keys()))
-        observacao = st.text_area("Observação")
-        if st.form_submit_button("Registrar lançamento", type="primary"):
+    mapa.update({f"{a.id} — {a.nome}{'' if a.ativo else ' (inativo)'}": a.id for a in alunos})
+    categorias = ["Mensalidade", "Atendimento", "Material", "Aluguel", "Serviços", "Impostos", "Transporte", "Outro"]
+    status_opcoes = ["Pendente", "Pago", "Cancelado"]
+    tab1, tab2 = st.tabs(["➕ Novo lançamento", "✏️ Consultar e editar lançamentos"])
+    with tab1:
+        with st.form("f_financeiro_novo", clear_on_submit=True):
+            tipo = st.selectbox("Tipo", ["Receita", "Despesa"])
+            descricao = st.text_input("Descrição *")
+            categoria = st.selectbox("Categoria", categorias)
+            valor = st.number_input("Valor (R$)", min_value=0.01, value=100.0, step=10.0)
+            vencimento = st.date_input("Data de vencimento", value=date.today(), format="DD/MM/YYYY")
+            aluno_label = st.selectbox("Aluno (opcional)", list(mapa))
+            observacao = st.text_area("Observação")
+            salvar = st.form_submit_button("Registrar lançamento", type="primary")
+        if salvar:
             if not descricao.strip():
                 st.error("Informe uma descrição.")
             else:
-                db.add(LancamentoFinanceiro(tipo=tipo, descricao=descricao.strip(),
-                    categoria=categoria, valor=float(valor), data_vencimento=vencimento,
-                    aluno_id=mapa[aluno_label], observacao=observacao.strip(), status="Pendente"))
-                db.commit()
-                st.success("Lançamento registrado.")
-                st.rerun()
-    lancamentos = db.query(LancamentoFinanceiro).order_by(LancamentoFinanceiro.data_vencimento.desc()).all()
-    st.subheader("Contas e movimentações")
-    if not lancamentos:
-        st.info("Nenhum lançamento financeiro cadastrado.")
-        return
-    filtro = st.selectbox("Filtrar situação", ["Todas", "Pendente", "Pago", "Cancelado"])
-    if filtro != "Todas":
-        lancamentos = [l for l in lancamentos if l.status == filtro]
-    st.dataframe(pd.DataFrame([{
-        "ID": l.id, "Tipo": l.tipo, "Descrição": l.descricao,
-        "Categoria": l.categoria, "Valor": moeda(l.valor),
-        "Vencimento": para_str_br(l.data_vencimento),
-        "Pagamento": para_str_br(l.data_pagamento), "Situação": l.status,
-        "Aluno": l.aluno.nome if l.aluno else "-",
-    } for l in lancamentos]), use_container_width=True, hide_index=True)
-    ids = {f"#{l.id} — {l.tipo} — {l.descricao} — {moeda(l.valor)}": l.id for l in lancamentos}
-    if ids:
-        selecionado = st.selectbox("Atualizar situação de um lançamento", list(ids.keys()))
-        lanc = db.get(LancamentoFinanceiro, ids[selecionado])
-        with st.form("f_status_financeiro"):
-            status = st.selectbox("Situação", ["Pendente", "Pago", "Cancelado"], index=["Pendente", "Pago", "Cancelado"].index(lanc.status if lanc.status in ["Pendente","Pago","Cancelado"] else "Pendente"))
-            data_pagamento = st.date_input("Data de pagamento (se pago)", value=lanc.data_pagamento or date.today(), format="DD/MM/YYYY")
-            if st.form_submit_button("Atualizar lançamento", type="primary"):
-                lanc.status = status
-                lanc.data_pagamento = data_pagamento if status == "Pago" else None
-                db.commit()
-                st.success("Lançamento atualizado.")
-                st.rerun()
-    csv = pd.DataFrame([{
-        "ID": l.id, "Tipo": l.tipo, "Descrição": l.descricao, "Categoria": l.categoria,
-        "Valor": l.valor, "Vencimento": para_str_br(l.data_vencimento),
-        "Pagamento": para_str_br(l.data_pagamento), "Situação": l.status,
-        "Aluno": l.aluno.nome if l.aluno else "",
-    } for l in db.query(LancamentoFinanceiro).all()]).to_csv(index=False).encode("utf-8-sig")
-    st.download_button("Exportar financeiro (CSV)", data=csv, file_name="financeiro_espaco_dinamico.csv", mime="text/csv")
-
+                try:
+                    db.add(LancamentoFinanceiro(tipo=tipo, descricao=descricao.strip(), categoria=categoria,
+                        valor=float(valor), data_vencimento=vencimento, aluno_id=mapa[aluno_label],
+                        observacao=observacao.strip(), status="Pendente"))
+                    db.commit()
+                    st.success("Lançamento registrado.")
+                    st.rerun()
+                except SQLAlchemyError as exc:
+                    db.rollback()
+                    mensagem_erro(exc, "cadastro do lançamento")
+    with tab2:
+        todos = db.query(LancamentoFinanceiro).order_by(LancamentoFinanceiro.data_vencimento.desc(), LancamentoFinanceiro.id.desc()).all()
+        if not todos:
+            st.info("Nenhum lançamento financeiro cadastrado.")
+            return
+        filtro = st.selectbox("Filtrar situação", ["Todas"] + status_opcoes, key="financeiro_filtro_status")
+        filtrados = todos if filtro == "Todas" else [l for l in todos if l.status == filtro]
+        st.dataframe(pd.DataFrame([{
+            "ID": l.id, "Tipo": l.tipo, "Descrição": l.descricao, "Categoria": l.categoria,
+            "Valor": moeda(l.valor), "Vencimento": para_str_br(l.data_vencimento),
+            "Pagamento": para_str_br(l.data_pagamento), "Situação": l.status,
+            "Aluno": l.aluno.nome if l.aluno else "-"
+        } for l in filtrados]), use_container_width=True, hide_index=True)
+        if filtrados:
+            opcoes = {f"#{l.id} — {l.tipo} — {l.descricao} — {moeda(l.valor)} — {l.status}": l.id for l in filtrados}
+            sel = st.selectbox("Selecione o lançamento para editar", list(opcoes), key="financeiro_editar_sel")
+            lanc = db.get(LancamentoFinanceiro, opcoes[sel])
+            atual_aluno = next((k for k, v in mapa.items() if v == lanc.aluno_id), "Sem vínculo com aluno")
+            with st.form(f"f_editar_lancamento_{lanc.id}"):
+                tipo_e = st.selectbox("Tipo", ["Receita", "Despesa"], index=["Receita", "Despesa"].index(lanc.tipo if lanc.tipo in ["Receita", "Despesa"] else "Receita"))
+                descricao_e = st.text_input("Descrição", value=lanc.descricao)
+                cat_atual = lanc.categoria if lanc.categoria in categorias else "Outro"
+                categoria_e = st.selectbox("Categoria", categorias, index=categorias.index(cat_atual))
+                valor_e = st.number_input("Valor (R$)", min_value=0.01, value=max(0.01, float(lanc.valor or 0)), step=10.0)
+                venc_e = st.date_input("Data de vencimento", value=lanc.data_vencimento or date.today(), format="DD/MM/YYYY")
+                aluno_e = st.selectbox("Aluno (opcional)", list(mapa), index=list(mapa).index(atual_aluno))
+                obs_e = st.text_area("Observação", value=lanc.observacao or "")
+                status_atual = lanc.status if lanc.status in status_opcoes else "Pendente"
+                status_e = st.selectbox("Situação", status_opcoes, index=status_opcoes.index(status_atual))
+                data_pag_e = st.date_input("Data de pagamento (se pago)", value=lanc.data_pagamento or date.today(), format="DD/MM/YYYY")
+                salvar_e = st.form_submit_button("Salvar alterações", type="primary")
+            if salvar_e:
+                if not descricao_e.strip():
+                    st.error("A descrição é obrigatória.")
+                else:
+                    lanc.tipo = tipo_e
+                    lanc.descricao = descricao_e.strip()
+                    lanc.categoria = categoria_e
+                    lanc.valor = float(valor_e)
+                    lanc.data_vencimento = venc_e
+                    lanc.aluno_id = mapa[aluno_e]
+                    lanc.observacao = obs_e.strip()
+                    lanc.status = status_e
+                    lanc.data_pagamento = data_pag_e if status_e == "Pago" else None
+                    try:
+                        db.commit()
+                        st.success("Lançamento atualizado.")
+                        st.rerun()
+                    except SQLAlchemyError as exc:
+                        db.rollback()
+                        mensagem_erro(exc, "edição do lançamento financeiro")
+            st.caption("Não exclua lançamentos pagos para preservar a trilha financeira. Se necessário, marque como Cancelado e registre a justificativa na observação.")
+        csv = pd.DataFrame([{
+            "ID": l.id, "Tipo": l.tipo, "Descrição": l.descricao, "Categoria": l.categoria,
+            "Valor": l.valor, "Vencimento": para_str_br(l.data_vencimento),
+            "Pagamento": para_str_br(l.data_pagamento), "Situação": l.status,
+            "Aluno": l.aluno.nome if l.aluno else "", "Observação": l.observacao or ""
+        } for l in todos]).to_csv(index=False).encode("utf-8-sig")
+        st.download_button("Exportar financeiro (CSV)", data=csv, file_name="financeiro_espaco_dinamico.csv", mime="text/csv")
 
 def tela_usuarios(db, perfil):
     st.title("Usuários e acessos")
