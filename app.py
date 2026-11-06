@@ -12,13 +12,18 @@ from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+
 from sqlalchemy import (
     Column, Date, Float, ForeignKey, Integer, String, Text,
     create_engine, inspect
 )
+from sqlalchemy.engine import URL
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.orm import declarative_base, relationship, sessionmaker
-
+from sqlalchemy.orm import (
+    declarative_base,
+    relationship,
+    sessionmaker
+)
 # ============================================================
 # ESPAÇO DINÂMICO — versão aprimorada, sem dependência obrigatória
 # de extra-streamlit-components.
@@ -31,26 +36,104 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+
+# ============================================================
+# CONFIGURAÇÃO DO BANCO DE DADOS
+# ESPAÇO DINÂMICO - SUPABASE POSTGRESQL
+# ============================================================
+
 BASE_DIR = Path(__file__).resolve().parent
-# Preserve an existing database in either the app folder or the current launch folder.
-# Prefer the app folder when its database already exists; otherwise reuse an existing
-# database in the launch folder before creating a new one.
+
+# Banco SQLite local - preservado como alternativa
 DB_IN_APP = BASE_DIR / "espaco_dinamico.db"
 DB_IN_CWD = Path.cwd() / "espaco_dinamico.db"
-if os.getenv("DATABASE_URL"):
-    DATABASE_URL = os.getenv("DATABASE_URL")
-else:
+
+
+def obter_database_url():
+
+    # 1. Verifica variável de ambiente
+    database_url = os.getenv("DATABASE_URL")
+
+    if database_url:
+        return database_url
+
+    # 2. Verifica Secrets do Streamlit Cloud
+    try:
+        cfg = st.secrets.get("database")
+    except Exception:
+        cfg = None
+
+    if cfg:
+
+        campos_obrigatorios = ["host", "user", "password"]
+
+        faltantes = [
+            campo for campo in campos_obrigatorios
+            if not cfg.get(campo)
+        ]
+
+        if faltantes:
+            raise RuntimeError(
+                "Configuração PostgreSQL incompleta. "
+                f"Campos ausentes: {', '.join(faltantes)}"
+            )
+
+        return URL.create(
+            drivername="postgresql+psycopg",
+            username=str(cfg["user"]),
+            password=str(cfg["password"]),
+            host=str(cfg["host"]),
+            port=int(cfg.get("port", 5432)),
+            database=str(cfg.get("name", "postgres")),
+            query={
+                "sslmode": str(cfg.get("sslmode", "require"))
+            }
+        )
+
+    # 3. Alternativa: SQLite local
     if DB_IN_APP.exists():
         DB_PATH = DB_IN_APP
     elif DB_IN_CWD.exists():
         DB_PATH = DB_IN_CWD
     else:
         DB_PATH = DB_IN_APP
-    DATABASE_URL = f"sqlite:///{DB_PATH.as_posix()}"
-CONNECT_ARGS = {"check_same_thread": False, "timeout": 30} if DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(DATABASE_URL, connect_args=CONNECT_ARGS, pool_pre_ping=True)
+
+    return f"sqlite:///{DB_PATH.as_posix()}"
+
+
+# Obtém a conexão configurada
+DATABASE_URL = obter_database_url()
+
+# Identifica o banco utilizado
+USANDO_SQLITE = str(DATABASE_URL).startswith("sqlite")
+
+# Argumentos específicos do SQLite
+CONNECT_ARGS = (
+    {"check_same_thread": False, "timeout": 30}
+    if USANDO_SQLITE else {}
+)
+
+# Criação da conexão SQLAlchemy
+engine = create_engine(
+    DATABASE_URL,
+    connect_args=CONNECT_ARGS,
+    pool_pre_ping=True,
+    pool_recycle=1800
+)
+
+# Base dos modelos
 Base = declarative_base()
-SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
+# Sessões do banco
+SessionLocal = sessionmaker(
+    bind=engine,
+    expire_on_commit=False
+)
+
+# ============================================================
+# FIM DA CONFIGURAÇÃO DO BANCO DE DADOS
+# ============================================================
+
 
 LOGO_CANDIDATES = [
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo_espaco_dinamico.png"),
@@ -151,52 +234,93 @@ class LancamentoFinanceiro(Base):
     aluno = relationship("Aluno")
 
 
+
 def backup_sqlite_automatico():
-    """Cria uma cópia diária antes de alterações no esquema, sem copiar banco aberto à força."""
-    if not DATABASE_URL.startswith("sqlite:///"):
+    """
+    Cria uma cópia diária do banco SQLite antes da inicialização
+    do esquema. Não executa backup SQLite no PostgreSQL.
+    """
+
+    # Backup automático somente quando estiver usando SQLite.
+    if not USANDO_SQLITE:
         return
-    caminho_texto = urllib.parse.unquote(DATABASE_URL.split("sqlite:///", 1)[1])
+
+    caminho_texto = urllib.parse.unquote(
+        DATABASE_URL.split("sqlite:///", 1)[1]
+    )
+
     banco = Path(caminho_texto)
+
     if not banco.is_absolute():
         banco = (Path.cwd() / banco).resolve()
+
     if not banco.exists() or banco.name == ":memory:":
         return
+
     pasta_backup = BASE_DIR / "backups_banco"
     pasta_backup.mkdir(parents=True, exist_ok=True)
-    destino = pasta_backup / f"{banco.stem}_{datetime.now():%Y%m%d}.db"
+
+    destino = pasta_backup / (
+        f"{banco.stem}_{datetime.now():%Y%m%d}.db"
+    )
+
     if destino.exists():
         return
-    # A API backup do SQLite é mais segura do que copiar um arquivo de banco em uso.
+
     origem_con = sqlite3.connect(str(banco), timeout=30)
     backup_con = sqlite3.connect(str(destino))
+
     try:
         origem_con.backup(backup_con)
+
     except Exception:
-        backup_con.close()
-        origem_con.close()
         try:
+            backup_con.close()
+            origem_con.close()
             destino.unlink(missing_ok=True)
-        except OSError:
+        except Exception:
             pass
+
         raise
+
     finally:
         try:
             backup_con.close()
         except Exception:
             pass
+
         try:
             origem_con.close()
         except Exception:
             pass
 
 
-# Cria backup diário antes de qualquer criação/alteração de tabelas.
+# ============================================================
+# INICIALIZAÇÃO DO BANCO DE DADOS
+# ============================================================
+
 try:
     backup_sqlite_automatico()
+
 except Exception as exc:
     print(f"[AVISO] Backup automático não concluído: {exc}")
-# create_all adds missing tables without deleting existing tables/rows.
-Base.metadata.create_all(engine)
+
+
+try:
+    # Cria somente tabelas inexistentes.
+    # Não exclui registros nem tabelas existentes.
+    Base.metadata.create_all(engine)
+
+except SQLAlchemyError as exc:
+    st.error(
+        "Não foi possível inicializar o banco de dados. "
+        "Verifique a conexão com o PostgreSQL e os Secrets."
+    )
+
+    print(f"[ERRO DATABASE] {exc}")
+
+    st.stop()
+
 
 
 # --------------------------- UTILITÁRIOS ---------------------

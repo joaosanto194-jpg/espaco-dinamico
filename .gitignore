@@ -1,3 +1,11 @@
-espaco_dinamico.db 
-backups_banco/ 
-.vscode/ 
+﻿.env
+.streamlit/secrets.toml
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.db
+*.sqlite
+*.sqlite3
+backups_banco/
+.vscode/
