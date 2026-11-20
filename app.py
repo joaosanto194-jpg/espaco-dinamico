@@ -875,12 +875,31 @@ def obter_config_storage():
     except Exception:
         cfg = {}
     # "or" (e não o padrão do get): campo presente mas vazio no secrets.toml cai para a variável de ambiente.
-    url = str(cfg.get("url") or os.getenv("SUPABASE_URL", "")).strip().rstrip("/")
-    chave = str(cfg.get("service_role_key") or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")).strip()
+    url = str(cfg.get("url") or os.getenv("SUPABASE_URL", "")).strip().strip('"').rstrip("/")
+    # Aceita a URL colada com sufixo da API (ex.: .../rest/v1 ou .../storage/v1).
+    url = re.sub(r"/(rest|storage|auth)/v1.*$", "", url)
+    chave = str(cfg.get("service_role_key") or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")).strip().strip('"')
     bucket = str(cfg.get("bucket") or "documentos-clinicos").strip()
     if not url or not chave:
         return None
     return {"url": url, "key": chave, "bucket": bucket}
+
+
+def tipo_chave_supabase(chave):
+    """Classifica a chave SEM expô-la: 'jwt' (legada), 'secret', 'publishable' ou 'desconhecida'."""
+    if chave.startswith("sb_secret_"):
+        return "secret"
+    if chave.startswith("sb_publishable_"):
+        return "publishable"
+    if chave.startswith("eyJ") and chave.count(".") == 2:
+        try:
+            import base64
+            carga = chave.split(".")[1]
+            dados = json.loads(base64.urlsafe_b64decode(carga + "=" * (-len(carga) % 4)))
+            return "jwt_" + str(dados.get("role", "?"))  # jwt_service_role / jwt_anon
+        except Exception:
+            return "jwt_?"
+    return "desconhecida"
 
 
 def requisicao_storage(metodo, endpoint, payload=None, content_type="application/json"):
@@ -891,16 +910,20 @@ def requisicao_storage(metodo, endpoint, payload=None, content_type="application
     corpo = payload
     if isinstance(payload, dict):
         corpo = json.dumps(payload).encode("utf-8")
-    headers = {
-        "apikey": cfg["key"],
-        "Authorization": f"Bearer {cfg['key']}",
-        "Content-Type": content_type,
-    }
+    headers = {"apikey": cfg["key"], "Content-Type": content_type}
+    # Chave legada (JWT) vai também no Authorization. As chaves novas (sb_secret_) não são JWT:
+    # no Authorization o Storage responde "Invalid Compact JWS"; o gateway usa só o apikey.
+    if tipo_chave_supabase(cfg["key"]).startswith("jwt"):
+        headers["Authorization"] = f"Bearer {cfg['key']}"
     req = urllib.request.Request(url, data=corpo, headers=headers, method=metodo)
     try:
         with urllib.request.urlopen(req, timeout=60) as resposta:
             bruto = resposta.read()
-            return json.loads(bruto.decode("utf-8")) if bruto else {}
+            try:
+                return json.loads(bruto.decode("utf-8")) if bruto else {}
+            except ValueError as exc:
+                # Resposta em HTML: a URL não é a da API do projeto (ex.: link do painel).
+                raise RuntimeError("RESPOSTA_NAO_JSON: a URL não parece ser a do projeto Supabase") from exc
     except urllib.error.HTTPError as exc:
         detalhe = exc.read().decode("utf-8", errors="replace")[:1000]
         raise RuntimeError(f"Supabase Storage retornou HTTP {exc.code}: {detalhe}") from exc
@@ -909,6 +932,30 @@ def requisicao_storage(metodo, endpoint, payload=None, content_type="application
 
 
 LIMITE_PDF_BYTES = 20 * 1024 * 1024
+
+
+def explicar_falha_storage(texto, cfg):
+    """Mensagem útil para o usuário a partir do erro técnico (o detalhe vai só para o log)."""
+    print(f"[AVISO] Diagnóstico do Storage: {texto[:500]}")
+    tipo = tipo_chave_supabase(cfg["key"])
+    url_ok = bool(re.fullmatch(r"https://[a-z0-9]{20}\.supabase\.co", cfg["url"]))
+    dica_url = "" if url_ok else (f" A URL cadastrada ({cfg['url'][:60]}) não está no formato "
+                                  "https://SEU-PROJETO.supabase.co.")
+    if "RESPOSTA_NAO_JSON" in texto or ("Falha de comunicação" in texto and not url_ok):
+        return "A URL do Supabase está errada: use a Project URL (https://SEU-PROJETO.supabase.co), não o link do painel." + dica_url
+    if "Falha de comunicação" in texto:
+        return "Não foi possível alcançar o Supabase (rede ou projeto pausado). Confira se o projeto está ativo no painel."
+    if tipo == "publishable" or tipo == "jwt_anon":
+        return ("A chave cadastrada é a chave PÚBLICA (anon/publishable). Use a chave secreta: "
+                "service_role (começa com eyJ…) ou secret (começa com sb_secret_…).")
+    if tipo == "desconhecida":
+        return ("A chave cadastrada não tem um formato reconhecido. Copie de novo a service_role/secret key, "
+                "sem espaços nem aspas extras." + dica_url)
+    if "HTTP 400" in texto or "HTTP 401" in texto or "HTTP 403" in texto:
+        return ("O Supabase recusou a chave (formato reconhecido: "
+                f"{'secret' if tipo == 'secret' else 'service_role'}). Confira se ela é do MESMO projeto da URL "
+                "e se não foi revogada." + dica_url)
+    return "O Supabase respondeu com erro. Tente de novo em instantes." + dica_url
 
 
 def diagnosticar_storage():
@@ -922,10 +969,9 @@ def diagnosticar_storage():
     try:
         buckets = requisicao_storage("GET", "bucket")
     except RuntimeError as exc:
-        texto = str(exc)
-        if "HTTP 401" in texto or "HTTP 403" in texto:
-            return "erro", "O Supabase recusou a chave. Confira se é a service_role (secret) key do projeto correto."
-        return "erro", "Não foi possível falar com o Supabase. Confira a URL do projeto e a internet."
+        return "erro", explicar_falha_storage(str(exc), cfg)
+    if not isinstance(buckets, list):
+        return "erro", "Resposta inesperada do Supabase. Confira se a URL é https://SEU-PROJETO.supabase.co."
     bucket = next((b for b in buckets or [] if b.get("id") == cfg["bucket"] or b.get("name") == cfg["bucket"]), None)
     if not bucket:
         return "sem_bucket", f"Conexão OK, mas o bucket '{cfg['bucket']}' ainda não existe."
