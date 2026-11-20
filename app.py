@@ -934,6 +934,23 @@ def requisicao_storage(metodo, endpoint, payload=None, content_type="application
 LIMITE_PDF_BYTES = 20 * 1024 * 1024
 
 
+def descrever_chave_invalida(chave):
+    """Diz o que há de errado com a chave usando só características dela (nunca o valor)."""
+    onde = (" Pegue a chave certa em Supabase → Project Settings → API Keys: aba 'API Keys' → Secret key "
+            "(sb_secret_…, clique em Reveal) ou aba 'Legacy API Keys' → service_role (eyJ…).")
+    if chave.lower().startswith("bearer"):
+        return "Tire a palavra 'Bearer' do início da chave nos Secrets." + onde
+    if re.search(r"\s", chave):
+        return "A chave tem espaço ou quebra de linha no meio: cole-a numa linha só, entre aspas." + onde
+    if chave.startswith("eyJ"):
+        return (f"A chave parece cortada ({chave.count('.') + 1} parte(s) de 3; {len(chave)} caracteres). "
+                "Copie-a inteira com o botão de copiar do Supabase." + onde)
+    if chave.startswith("sb_"):
+        return "A chave começa com sb_ mas não é sb_secret_. Use a Secret key." + onde
+    return (f"A chave cadastrada ({len(chave)} caracteres) não é uma chave de API do Supabase. "
+            "Não use o 'JWT Secret' nem a senha do banco." + onde)
+
+
 def explicar_falha_storage(texto, cfg):
     """Mensagem útil para o usuário a partir do erro técnico (o detalhe vai só para o log)."""
     print(f"[AVISO] Diagnóstico do Storage: {texto[:500]}")
@@ -948,9 +965,8 @@ def explicar_falha_storage(texto, cfg):
     if tipo == "publishable" or tipo == "jwt_anon":
         return ("A chave cadastrada é a chave PÚBLICA (anon/publishable). Use a chave secreta: "
                 "service_role (começa com eyJ…) ou secret (começa com sb_secret_…).")
-    if tipo == "desconhecida":
-        return ("A chave cadastrada não tem um formato reconhecido. Copie de novo a service_role/secret key, "
-                "sem espaços nem aspas extras." + dica_url)
+    if tipo == "desconhecida" or tipo == "jwt_?":
+        return descrever_chave_invalida(cfg["key"]) + dica_url
     if "HTTP 400" in texto or "HTTP 401" in texto or "HTTP 403" in texto:
         return ("O Supabase recusou a chave (formato reconhecido: "
                 f"{'secret' if tipo == 'secret' else 'service_role'}). Confira se ela é do MESMO projeto da URL "
