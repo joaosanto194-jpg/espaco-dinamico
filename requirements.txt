@@ -4,3 +4,4 @@ sqlalchemy
 plotly
 psycopg[binary]
 reportlab
+pypdf

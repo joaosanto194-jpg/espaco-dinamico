@@ -44,6 +44,13 @@ Menu e acesso definidos em `MENU_PAGINAS` e `PERMISSOES`:
 - Configurações institucionais lidas do banco; registro de auditoria visível em Configurações.
 - Correções: data de nascimento sobrescrita com hoje ao editar aluno; status "Realizado" virando "Planejada"; proteção do último Admin; link de PDF gerado só sob demanda.
 
+## Já implementado (20/11/2026, tarde)
+
+- Publicado no Streamlit Cloud; o app publicado usa o PostgreSQL do Supabase (`[database]` nos Secrets do Cloud). Backup CSV antes de publicar fica em `backups_banco/` (fora do git).
+- Recibos em PDF (reportlab) para receitas pagas, em 💰 Financeiro; `documento_profissional` e `cidade` em Configurações.
+- `painel_storage(usuario, prefixo)`: diagnóstico do Supabase Storage + botão para criar o bucket privado. Usado pela Guarda documental e pelos Materiais.
+- 📁 Atividades → 📎 Materiais em PDF: tabela `materiais_pedagogicos`. Importa vários PDFs (Atividade / Material escolar / Avaliação), para um aluno ou o acervo geral (`aluno_id` NULL), e pode criar uma atividade planejada por arquivo. O texto é extraído com pypdf para a busca, sem `\x00`, que o Postgres recusa. Biblioteca com filtros, busca dentro do PDF, link temporário, edição, vínculo a uma atividade e arquivamento. Arquivos ficam em `materiais/...` no mesmo bucket.
+
 ## Pendências / próximos passos
 
 1. Testar o portal da família localmente (gerar link → "Abrir o portal (testar)").

@@ -292,6 +292,34 @@ class LinkFamiliar(Base):
     aluno = relationship("Aluno")
 
 
+class MaterialPedagogico(Base):
+    """PDF de atividade, material escolar ou avaliação.
+
+    aluno_id vazio = acervo geral (material reutilizável para vários alunos).
+    atividade_id liga o PDF a uma atividade registrada em 📁 Atividades.
+    """
+    __tablename__ = "materiais_pedagogicos"
+    id = Column(Integer, primary_key=True)
+    titulo = Column(String(180), nullable=False)
+    tipo = Column(String(40), nullable=False, default="Atividade")
+    area = Column(String(100), nullable=True)
+    nivel = Column(String(100), nullable=True)  # série / ano escolar / faixa
+    descricao = Column(Text, nullable=True)
+    aluno_id = Column(Integer, ForeignKey("alunos.id"), nullable=True, index=True)
+    atividade_id = Column(Integer, ForeignKey("atividades_alunos.id"), nullable=True, index=True)
+    nome_original = Column(String(255), nullable=False)
+    caminho_storage = Column(String(500), nullable=False, unique=True)
+    tamanho_bytes = Column(Integer, nullable=False, default=0)
+    paginas = Column(Integer, nullable=True)
+    sha256 = Column(String(64), nullable=False, index=True)
+    texto_extraido = Column(Text, nullable=True)  # usado só na busca interna
+    status = Column(String(20), nullable=False, default="Ativo")
+    criado_em = Column(DateTime, nullable=False, default=datetime.now)
+    criado_por = Column(String(100), nullable=True)
+    aluno = relationship("Aluno")
+    atividade = relationship("AtividadeAluno")
+
+
 class LogAuditoria(Base):
     """Trilha de quem fez o quê (login, links, senhas, mensalidades, documentos)."""
     __tablename__ = "log_auditoria"
@@ -846,9 +874,10 @@ def obter_config_storage():
         cfg = st.secrets.get("supabase", {})
     except Exception:
         cfg = {}
-    url = str(cfg.get("url", os.getenv("SUPABASE_URL", ""))).strip().rstrip("/")
-    chave = str(cfg.get("service_role_key", os.getenv("SUPABASE_SERVICE_ROLE_KEY", ""))).strip()
-    bucket = str(cfg.get("bucket", "documentos-clinicos")).strip()
+    # "or" (e não o padrão do get): campo presente mas vazio no secrets.toml cai para a variável de ambiente.
+    url = str(cfg.get("url") or os.getenv("SUPABASE_URL", "")).strip().rstrip("/")
+    chave = str(cfg.get("service_role_key") or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")).strip()
+    bucket = str(cfg.get("bucket") or "documentos-clinicos").strip()
     if not url or not chave:
         return None
     return {"url": url, "key": chave, "bucket": bucket}
@@ -943,6 +972,104 @@ def excluir_objeto_storage(caminho):
         return
     endpoint = f"object/{urllib.parse.quote(cfg['bucket'], safe='')}"
     requisicao_storage("DELETE", endpoint, {"prefixes": [caminho]})
+
+
+# --------------------------- MATERIAIS EM PDF ----------------
+TIPOS_MATERIAL = ["Atividade", "Material escolar", "Avaliação"]
+LIMITE_TEXTO_EXTRAIDO = 200_000  # caracteres guardados para a busca
+
+
+def validar_pdf(conteudo):
+    """Retorna None se o PDF é aceitável; senão, a mensagem de erro para o usuário."""
+    if not conteudo:
+        return "arquivo vazio"
+    if len(conteudo) > LIMITE_PDF_BYTES:
+        return "excede o limite de 20 MB"
+    if not conteudo.startswith(b"%PDF-"):
+        return "não é um PDF válido"
+    return None
+
+
+def extrair_info_pdf(conteudo, max_paginas=60):
+    """Conta páginas e extrai texto para a busca. Falha de leitura não impede a importação."""
+    from io import BytesIO
+    try:
+        from pypdf import PdfReader
+        leitor = PdfReader(BytesIO(conteudo))
+        if leitor.is_encrypted and not leitor.decrypt(""):
+            return None, ""  # PDF protegido por senha: guarda o arquivo, sem texto
+        paginas = len(leitor.pages)
+        partes = []
+        for pagina in leitor.pages[:max_paginas]:
+            try:
+                partes.append(pagina.extract_text() or "")
+            except Exception:
+                continue
+        # O PostgreSQL recusa o caractere nulo (\x00) em colunas TEXT.
+        texto = re.sub(r"[ \t]+", " ", "\n".join(partes).replace("\x00", "")).strip()
+        return paginas, texto[:LIMITE_TEXTO_EXTRAIDO]
+    except Exception as exc:
+        print(f"[AVISO] Não foi possível ler o conteúdo do PDF: {exc}")
+        return None, ""
+
+
+def titulo_pelo_arquivo(nome_arquivo):
+    """'Atividade_fracoes-3ano.pdf' -> 'Atividade fracoes 3ano'."""
+    base = Path(str(nome_arquivo or "")).stem
+    return re.sub(r"[_\-]+", " ", base).strip()[:180] or "Material sem título"
+
+
+def importar_material_pdf(db, conteudo, nome_arquivo, dados, usuario_nome):
+    """Valida, envia ao Storage e registra UM PDF. Retorna (material, aviso).
+
+    Se a gravação no banco falhar depois do envio, o arquivo é apagado do Storage
+    para não deixar órfãos. Duplicados (mesmo conteúdo e mesmo aluno) são ignorados.
+    """
+    erro = validar_pdf(conteudo)
+    if erro:
+        return None, f"{nome_arquivo}: {erro}."
+    digest = hashlib.sha256(conteudo).hexdigest()
+    aluno_id = dados.get("aluno_id")
+    duplicado = (db.query(MaterialPedagogico)
+                 .filter_by(sha256=digest, aluno_id=aluno_id, status="Ativo").first())
+    if duplicado:
+        return None, f"{nome_arquivo}: já importado como “{duplicado.titulo}” (#{duplicado.id})."
+    paginas, texto = extrair_info_pdf(conteudo)
+    pasta = f"aluno_{aluno_id}" if aluno_id else "acervo_geral"
+    caminho = f"materiais/{pasta}/{uuid.uuid4().hex}.pdf"
+    titulo = (dados.get("titulo") or "").strip() or titulo_pelo_arquivo(nome_arquivo)
+
+    enviar_pdf_storage(caminho, conteudo)
+    try:
+        atividade_id = dados.get("atividade_id")
+        if dados.get("criar_atividade") and aluno_id and not atividade_id:
+            atividade = AtividadeAluno(
+                aluno_id=aluno_id, titulo=titulo[:150], categoria=dados.get("categoria") or "Intervenção",
+                area=(dados.get("area") or "").strip(), data_atividade=dados.get("data") or date.today(),
+                objetivo=(dados.get("descricao") or "").strip(), status="Planejada",
+                descricao=f"{dados.get('tipo', 'Atividade')} em PDF: {Path(nome_arquivo).name}",
+            )
+            db.add(atividade)
+            db.flush()
+            atividade_id = atividade.id
+        material = MaterialPedagogico(
+            titulo=titulo, tipo=dados.get("tipo") or "Atividade", area=(dados.get("area") or "").strip(),
+            nivel=(dados.get("nivel") or "").strip(), descricao=(dados.get("descricao") or "").strip(),
+            aluno_id=aluno_id, atividade_id=atividade_id, nome_original=Path(nome_arquivo).name[:255],
+            caminho_storage=caminho, tamanho_bytes=len(conteudo), paginas=paginas, sha256=digest,
+            texto_extraido=texto, status="Ativo", criado_em=datetime.now(), criado_por=usuario_nome,
+        )
+        db.add(material)
+        db.commit()
+    except Exception:
+        db.rollback()
+        try:
+            excluir_objeto_storage(caminho)
+        except Exception as limpeza_exc:
+            print(f"[AVISO] Falha ao limpar arquivo órfão: {limpeza_exc}")
+        raise
+    aviso = None if texto else f"{nome_arquivo}: importado, mas sem texto pesquisável (PDF escaneado/imagem)."
+    return material, aviso
 
 
 def formatar_tamanho(bytes_total):
@@ -1603,7 +1730,195 @@ def tela_prontuario(db):
                         mensagem_erro(exc, "edição da evolução")
             st.warning("Prontuários são registros históricos sensíveis. A exclusão física não é disponibilizada nesta tela; corrija o conteúdo mantendo o histórico no sistema.")
 
-def tela_atividades(db):
+ACERVO_GERAL = "📚 Acervo geral (sem aluno)"
+
+
+def trecho_encontrado(texto, termo, margem=90):
+    """Pedaço do texto do PDF em volta do termo buscado, para mostrar onde ele aparece."""
+    if not texto or not termo:
+        return ""
+    pos = texto.casefold().find(termo.casefold())
+    if pos < 0:
+        return ""
+    inicio, fim = max(0, pos - margem), min(len(texto), pos + len(termo) + margem)
+    return ("…" if inicio else "") + texto[inicio:fim].replace("\n", " ") + ("…" if fim < len(texto) else "")
+
+
+def tela_materiais_pdf(db, usuario, alunos, categorias):
+    st.markdown("Guarde **atividades, materiais escolares e avaliações** em PDF, vinculados a um aluno "
+                "ou no **acervo geral** para reutilizar. Os arquivos ficam no armazenamento privado.")
+    if not painel_storage(usuario, "storage_materiais"):
+        return
+    mapa_destino = {ACERVO_GERAL: None}
+    mapa_destino.update({f"{a.id} — {a.nome}{'' if a.ativo else ' (inativo)'}": a.id for a in alunos})
+    aba_importar, aba_biblioteca = st.tabs(["⬆️ Importar PDFs", "🔎 Biblioteca de materiais"])
+
+    with aba_importar:
+        with st.form("f_importar_materiais", clear_on_submit=True):
+            arquivos = st.file_uploader("PDFs (pode selecionar vários de uma vez, até 20 MB cada)",
+                                        type=["pdf"], accept_multiple_files=True)
+            c1, c2 = st.columns(2)
+            tipo = c1.selectbox("Tipo", TIPOS_MATERIAL)
+            destino = c2.selectbox("Guardar para", list(mapa_destino))
+            titulo = st.text_input("Título (opcional)",
+                                   help="Em branco, usa o nome do arquivo. Com vários arquivos, vira um prefixo.")
+            c3, c4, c5 = st.columns(3)
+            area = c3.text_input("Área / disciplina", placeholder="ex.: Matemática — frações")
+            nivel = c4.text_input("Série / nível", placeholder="ex.: 3º ano")
+            data_ref = c5.date_input("Data de referência", value=date.today(), format="DD/MM/YYYY")
+            descricao = st.text_area("Descrição / objetivo", placeholder="Para que serve, como aplicar, critérios da avaliação…")
+            c6, c7 = st.columns([2, 1])
+            criar_atividade = c6.checkbox("Criar também uma atividade planejada para o aluno (uma por arquivo)",
+                                          help="Só vale quando o PDF é guardado para um aluno.")
+            categoria = c7.selectbox("Categoria da atividade", categorias)
+            importar = st.form_submit_button("Importar PDFs", type="primary")
+        if importar:
+            aluno_id = mapa_destino[destino]
+            if not arquivos:
+                st.error("Selecione pelo menos um arquivo PDF.")
+            else:
+                importados, avisos = [], []
+                barra = st.progress(0.0, text="Importando…")
+                for i, arq in enumerate(arquivos, start=1):
+                    titulo_arq = titulo.strip()
+                    if titulo_arq and len(arquivos) > 1:
+                        titulo_arq = f"{titulo_arq} — {titulo_pelo_arquivo(arq.name)}"
+                    dados = {"titulo": titulo_arq, "tipo": tipo, "area": area, "nivel": nivel, "descricao": descricao,
+                             "aluno_id": aluno_id, "data": data_ref, "categoria": categoria,
+                             "criar_atividade": criar_atividade and aluno_id is not None}
+                    try:
+                        material, aviso = importar_material_pdf(db, arq.getvalue(), arq.name, dados, usuario.nome)
+                    except Exception as exc:
+                        print(f"[ERRO] importação de material {arq.name}: {exc}")
+                        avisos.append(f"{arq.name}: não foi possível importar (falha no envio ou no banco).")
+                    else:
+                        if material:
+                            importados.append(material)
+                        if aviso:
+                            avisos.append(aviso)
+                    barra.progress(i / len(arquivos), text=f"Importando… {i}/{len(arquivos)}")
+                barra.empty()
+                if importados:
+                    registrar_auditoria("materiais_importados",
+                                        f"{len(importados)} PDF(s); tipo={tipo}; aluno_id={aluno_id or 'acervo'}; "
+                                        f"ids={','.join(str(m.id) for m in importados)}", usuario.nome)
+                    extra = " e atividade(s) criada(s)" if criar_atividade and aluno_id else ""
+                    st.success(f"{len(importados)} PDF(s) importado(s){extra}. Veja em 🔎 Biblioteca de materiais.")
+                if criar_atividade and aluno_id is None:
+                    st.info("Nenhuma atividade foi criada: o material foi para o acervo geral, sem aluno.")
+                for aviso in avisos:
+                    st.warning(aviso)
+
+    with aba_biblioteca:
+        f1, f2, f3 = st.columns([2, 1, 1])
+        busca = f1.text_input("Buscar no título, descrição, área ou **dentro do PDF**", key="mat_busca").strip()
+        filtro_tipo = f2.selectbox("Tipo", ["Todos"] + TIPOS_MATERIAL, key="mat_tipo")
+        filtro_dest = f3.selectbox("Aluno", ["Todos"] + list(mapa_destino), key="mat_aluno")
+        incluir_arquivados = st.checkbox("Incluir arquivados", key="mat_arquivados")
+        M = MaterialPedagogico
+        consulta = db.query(M).options(joinedload(M.aluno), joinedload(M.atividade))
+        if busca:
+            termo = f"%{busca}%"
+            consulta = consulta.filter(or_(M.titulo.ilike(termo), M.descricao.ilike(termo), M.area.ilike(termo),
+                                           M.nivel.ilike(termo), M.texto_extraido.ilike(termo)))
+        if filtro_tipo != "Todos":
+            consulta = consulta.filter(M.tipo == filtro_tipo)
+        if filtro_dest != "Todos":
+            aluno_f = mapa_destino[filtro_dest]
+            consulta = consulta.filter(M.aluno_id.is_(None) if aluno_f is None else M.aluno_id == aluno_f)
+        if not incluir_arquivados:
+            consulta = consulta.filter(M.status == "Ativo")
+        materiais = consulta.order_by(M.criado_em.desc(), M.id.desc()).limit(500).all()
+        if not materiais:
+            st.info("Nenhum material encontrado com esses filtros.")
+            return
+        st.caption(f"{len(materiais)} material(is) encontrado(s).")
+        st.dataframe(pd.DataFrame([{
+            "ID": m.id, "Título": m.titulo, "Tipo": m.tipo,
+            "Aluno": m.aluno.nome if m.aluno else "Acervo geral", "Área": m.area or "-", "Nível": m.nivel or "-",
+            "Páginas": m.paginas or "-", "Tamanho": formatar_tamanho(m.tamanho_bytes),
+            "Atividade": f"#{m.atividade_id} {m.atividade.titulo}" if m.atividade else "-",
+            "Importado em": formatar_data_hora(m.criado_em), "Por": m.criado_por or "-", "Situação": m.status,
+        } for m in materiais]), width="stretch", hide_index=True)
+
+        opcoes = {f"#{m.id} — {m.titulo} ({m.aluno.nome if m.aluno else 'acervo'})": m.id for m in materiais}
+        mat = db.get(M, opcoes[st.selectbox("Material", list(opcoes), key="mat_sel")])
+        if busca:
+            trecho = trecho_encontrado(mat.texto_extraido, busca)
+            if trecho:
+                st.markdown(f"> {html.escape(trecho)}")
+        b1, b2 = st.columns(2)
+        with b1:
+            chave_link = f"link_mat_{mat.id}"
+            if st.button("Gerar link para abrir (10 min)", key=f"btn_{chave_link}", width="stretch"):
+                try:
+                    st.session_state[chave_link] = gerar_link_pdf(mat.caminho_storage)
+                    registrar_auditoria("material_aberto", f"material_id={mat.id}", usuario.nome)
+                except Exception as exc:
+                    mensagem_erro(exc, "geração do acesso ao PDF")
+            if st.session_state.get(chave_link):
+                st.link_button("📄 Abrir PDF", st.session_state[chave_link], width="stretch")
+        with b2:
+            arquivar = mat.status == "Ativo"
+            confirmar = st.checkbox("Confirmo " + ("o arquivamento" if arquivar else "a reativação"), key=f"conf_mat_{mat.id}")
+            if st.button("Arquivar material" if arquivar else "Reativar material", key=f"arq_mat_{mat.id}",
+                         disabled=not confirmar, width="stretch"):
+                try:
+                    mat.status = "Arquivado" if arquivar else "Ativo"
+                    db.commit()
+                except SQLAlchemyError as exc:
+                    db.rollback()
+                    mensagem_erro(exc, "alteração do material")
+                else:
+                    registrar_auditoria("material_arquivado" if arquivar else "material_reativado",
+                                        f"material_id={mat.id}", usuario.nome)
+                    st.rerun()
+
+        with st.expander("✏️ Editar dados do material"):
+            atividades_aluno = (db.query(AtividadeAluno).filter_by(aluno_id=mat.aluno_id)
+                                .order_by(AtividadeAluno.data_atividade.desc()).all() if mat.aluno_id else [])
+            mapa_ativ = {"Nenhuma": None}
+            mapa_ativ.update({f"#{a.id} — {a.titulo} ({para_str_br(a.data_atividade)})": a.id for a in atividades_aluno})
+            dest_atual = next((k for k, v in mapa_destino.items() if v == mat.aluno_id), ACERVO_GERAL)
+            ativ_atual = next((k for k, v in mapa_ativ.items() if v == mat.atividade_id), "Nenhuma")
+            with st.form(f"f_editar_material_{mat.id}"):
+                titulo_e = st.text_input("Título", value=mat.titulo)
+                e1, e2 = st.columns(2)
+                tipo_e = e1.selectbox("Tipo", TIPOS_MATERIAL,
+                                      index=TIPOS_MATERIAL.index(mat.tipo) if mat.tipo in TIPOS_MATERIAL else 0)
+                dest_e = e2.selectbox("Guardar para", list(mapa_destino), index=list(mapa_destino).index(dest_atual))
+                e3, e4 = st.columns(2)
+                area_e = e3.text_input("Área / disciplina", value=mat.area or "")
+                nivel_e = e4.text_input("Série / nível", value=mat.nivel or "")
+                ativ_e = st.selectbox("Vincular à atividade do aluno", list(mapa_ativ), index=list(mapa_ativ).index(ativ_atual),
+                                      help="Lista as atividades do aluno atual. Se trocar o aluno, salve e escolha a atividade depois.")
+                desc_e = st.text_area("Descrição / objetivo", value=mat.descricao or "")
+                salvar_e = st.form_submit_button("Salvar alterações", type="primary")
+            if salvar_e:
+                if not titulo_e.strip():
+                    st.error("O título é obrigatório.")
+                else:
+                    novo_aluno = mapa_destino[dest_e]
+                    try:
+                        mat.titulo = titulo_e.strip()[:180]
+                        mat.tipo = tipo_e
+                        mat.area = area_e.strip()
+                        mat.nivel = nivel_e.strip()
+                        mat.descricao = desc_e.strip()
+                        # Atividade só faz sentido se for do mesmo aluno.
+                        mat.atividade_id = mapa_ativ[ativ_e] if novo_aluno == mat.aluno_id else None
+                        mat.aluno_id = novo_aluno
+                        db.commit()
+                    except SQLAlchemyError as exc:
+                        db.rollback()
+                        mensagem_erro(exc, "edição do material")
+                    else:
+                        registrar_auditoria("material_editado", f"material_id={mat.id}", usuario.nome)
+                        st.rerun()
+            st.caption(f"Arquivo original: {mat.nome_original} · SHA-256 {mat.sha256[:16]}…")
+
+
+def tela_atividades(db, usuario):
     st.title("Atividades pedagógicas")
     st.caption("Planejamento, execução e acompanhamento individual das atividades.")
     alunos = db.query(Aluno).order_by(Aluno.nome).all()
@@ -1613,7 +1928,10 @@ def tela_atividades(db):
     mapa = {f"{a.id} — {a.nome}{'' if a.ativo else ' (inativo)'}": a.id for a in alunos}
     categorias = ["Intervenção", "Leitura", "Escrita", "Matemática", "Atenção", "Memória", "Linguagem", "Coordenação motora", "Outro"]
     status_opcoes = ["Planejada", "Em andamento", "Realizada", "Reagendada", "Cancelada"]
-    tab1, tab2, tab3 = st.tabs(["➕ Nova atividade", "📋 Consultar e editar", "📊 Acompanhamento"])
+    tab1, tab2, tab3, tab4 = st.tabs(["➕ Nova atividade", "📋 Consultar e editar", "📊 Acompanhamento",
+                                      "📎 Materiais em PDF"])
+    with tab4:
+        tela_materiais_pdf(db, usuario, alunos, categorias)
     with tab1:
         ativos = {f"{a.id} — {a.nome}": a.id for a in alunos if a.ativo}
         if not ativos:
@@ -1719,6 +2037,12 @@ def tela_atividades(db):
                         except SQLAlchemyError as exc:
                             db.rollback()
                             mensagem_erro(exc, "edição da atividade")
+                anexos = (db.query(MaterialPedagogico)
+                          .filter_by(atividade_id=atividade.id, status="Ativo").order_by(MaterialPedagogico.id).all())
+                if anexos:
+                    st.markdown("**📎 PDFs desta atividade:** " + " · ".join(
+                        f"#{m.id} {html.escape(m.titulo)} ({m.tipo})" for m in anexos))
+                    st.caption("Para abrir, use a aba 📎 Materiais em PDF → Biblioteca.")
                 st.caption("O histórico não é apagado: utilize Cancelada para atividades que não serão executadas.")
     with tab3:
         todos = db.query(AtividadeAluno).all()
@@ -1741,12 +2065,11 @@ def tela_atividades(db):
             st.info("Ainda não há atividades para consolidar.")
 
 
-def tela_guarda_documental(db, usuario):
-    st.title("Guarda documental")
-    st.caption("Repositório privado de documentos PDF vinculados aos alunos.")
-    if usuario.perfil not in ("Admin", "Profissional"):
-        st.error("Acesso restrito aos perfis Admin e Profissional.")
-        return
+def painel_storage(usuario, prefixo="storage"):
+    """Mostra a situação do Supabase Storage. Retorna True se os envios estão liberados.
+
+    Usado pela Guarda documental e pelos Materiais em PDF (mesmo bucket privado).
+    """
     cfg = obter_config_storage()
     if not cfg:
         st.warning("O armazenamento ainda não está configurado. Cadastre as credenciais privadas do Supabase nos Secrets para habilitar os envios.")
@@ -1756,7 +2079,7 @@ def tela_guarda_documental(db, usuario):
             "3. Reinicie o app e volte aqui: o sistema confere a conexão e cria o bucket privado.")
         st.code('[supabase]\nurl = "https://SEU-PROJETO.supabase.co"\nservice_role_key = "SUA_SERVICE_ROLE_KEY"\nbucket = "documentos-clinicos"', language="toml")
         st.info("Não publique a service_role_key nem a coloque no código do GitHub: ela dá acesso total ao projeto.")
-        return
+        return False
 
     # Diagnóstico guardado na sessão para não consultar o Supabase a cada clique.
     if "storage_diagnostico" not in st.session_state:
@@ -1765,11 +2088,11 @@ def tela_guarda_documental(db, usuario):
     with st.expander("☁️ Situação do armazenamento", expanded=situacao != "ok"):
         {"ok": st.success, "publico": st.error, "sem_bucket": st.warning}.get(situacao, st.error)(msg)
         b1, b2 = st.columns(2)
-        if b1.button("🔄 Verificar novamente", key="storage_verificar", width="stretch"):
+        if b1.button("🔄 Verificar novamente", key=f"{prefixo}_verificar", width="stretch"):
             st.session_state.pop("storage_diagnostico", None)
             st.rerun()
         if situacao == "sem_bucket" and usuario.perfil == "Admin":
-            if b2.button("Criar bucket privado agora", key="storage_criar_bucket", type="primary", width="stretch"):
+            if b2.button("Criar bucket privado agora", key=f"{prefixo}_criar_bucket", type="primary", width="stretch"):
                 try:
                     criar_bucket_privado()
                 except RuntimeError as exc:
@@ -1782,6 +2105,17 @@ def tela_guarda_documental(db, usuario):
     if situacao in ("erro", "sem_bucket", "publico"):
         if situacao == "sem_bucket" and usuario.perfil != "Admin":
             st.info("Peça a um administrador para criar o bucket nesta tela.")
+        return False
+    return True
+
+
+def tela_guarda_documental(db, usuario):
+    st.title("Guarda documental")
+    st.caption("Repositório privado de documentos PDF vinculados aos alunos.")
+    if usuario.perfil not in ("Admin", "Profissional"):
+        st.error("Acesso restrito aos perfis Admin e Profissional.")
+        return
+    if not painel_storage(usuario, "storage_guarda"):
         return
     alunos = db.query(Aluno).order_by(Aluno.nome).all()
     if not alunos:
@@ -2564,7 +2898,7 @@ def main():
             "👥 Alunos e responsáveis": lambda: tela_cadastros(db),
             "📄 Contratos": lambda: tela_contratos(db),
             "📂 Prontuários": lambda: tela_prontuario(db),
-            "📁 Atividades": lambda: tela_atividades(db),
+            "📁 Atividades": lambda: tela_atividades(db, usuario),
             "🗄️ Guarda documental": lambda: tela_guarda_documental(db, usuario),
             "💰 Financeiro": lambda: tela_financeiro(db),
             "📈 Desempenho": lambda: tela_desempenho(db, usuario),
