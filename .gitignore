@@ -9,3 +9,7 @@ __pycache__/
 *.sqlite3
 backups_banco/
 .vscode/
+
+# Anotações com senhas/credenciais do banco: nunca versionar
+senha*.txt
+postgreSQL.txt
