@@ -1,12 +1,19 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+import calendar
 import hashlib
+import html
+import json
+import time
 import os
 import re
 import secrets
 import shutil
 import sqlite3
 import urllib.parse
+import urllib.request
+import urllib.error
 import textwrap
+import uuid
 from pathlib import Path
 
 import pandas as pd
@@ -14,13 +21,14 @@ import plotly.express as px
 import streamlit as st
 
 from sqlalchemy import (
-    Column, Date, Float, ForeignKey, Integer, String, Text,
-    create_engine, inspect
+    Column, Date, DateTime, Float, ForeignKey, Integer, String, Text,
+    create_engine, func, inspect, or_, text as sql_text
 )
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import (
     declarative_base,
+    joinedload,
     relationship,
     sessionmaker
 )
@@ -107,19 +115,26 @@ DATABASE_URL = obter_database_url()
 # Identifica o banco utilizado
 USANDO_SQLITE = str(DATABASE_URL).startswith("sqlite")
 
-# Argumentos específicos do SQLite
-CONNECT_ARGS = (
-    {"check_same_thread": False, "timeout": 30}
-    if USANDO_SQLITE else {}
-)
 
-# Criação da conexão SQLAlchemy
-engine = create_engine(
-    DATABASE_URL,
-    connect_args=CONNECT_ARGS,
-    pool_pre_ping=True,
-    pool_recycle=1800
-)
+@st.cache_resource(show_spinner=False)
+def criar_engine():
+    """Cria UM pool de conexões por processo.
+
+    O Streamlit reexecuta o script inteiro a cada clique; antes, um novo
+    engine (e um novo pool de conexões com o Supabase) era criado em toda
+    interação, deixando o sistema lento e consumindo conexões.
+    """
+    url = obter_database_url()
+    sqlite = str(url).startswith("sqlite")
+    return create_engine(
+        url,
+        connect_args={"check_same_thread": False, "timeout": 30} if sqlite else {},
+        pool_pre_ping=True,
+        pool_recycle=1800,
+    )
+
+
+engine = criar_engine()
 
 # Base dos modelos
 Base = declarative_base()
@@ -208,8 +223,32 @@ class AtividadeAluno(Base):
     data_atividade = Column(Date, default=date.today)
     titulo = Column(String(150), nullable=False)
     descricao = Column(Text)
-    status = Column(String(30), default="Realizado")
+    status = Column(String(30), default="Realizada")
+    # Campos novos são adicionados por migração aditiva e preservam registros legados.
+    area = Column(String(100), nullable=True)
+    objetivo = Column(Text, nullable=True)
+    data_prazo = Column(Date, nullable=True)
+    resultado = Column(Text, nullable=True)
+    observacoes = Column(Text, nullable=True)
     aluno = relationship("Aluno", back_populates="atividades")
+
+
+class DocumentoAluno(Base):
+    __tablename__ = "documentos_alunos"
+    id = Column(Integer, primary_key=True)
+    aluno_id = Column(Integer, ForeignKey("alunos.id"), nullable=False, index=True)
+    titulo = Column(String(180), nullable=False)
+    categoria = Column(String(80), nullable=False)
+    descricao = Column(Text, nullable=True)
+    nome_original = Column(String(255), nullable=False)
+    caminho_storage = Column(String(500), nullable=False, unique=True)
+    mime_type = Column(String(100), nullable=False, default="application/pdf")
+    tamanho_bytes = Column(Integer, nullable=False, default=0)
+    sha256 = Column(String(64), nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="Ativo")
+    criado_em = Column(Date, nullable=False, default=date.today)
+    criado_por = Column(String(100), nullable=True)
+    aluno = relationship("Aluno")
 
 
 class ConfiguracaoSistema(Base):
@@ -233,6 +272,34 @@ class LancamentoFinanceiro(Base):
     observacao = Column(Text)
     aluno = relationship("Aluno")
 
+
+class LinkFamiliar(Base):
+    """Link individual e revogável para a família acompanhar o desempenho.
+
+    Guarda apenas o hash SHA-256 do token: quem tiver acesso ao banco não
+    consegue reconstruir o link.
+    """
+    __tablename__ = "links_familiares"
+    id = Column(Integer, primary_key=True)
+    aluno_id = Column(Integer, ForeignKey("alunos.id"), nullable=False, index=True)
+    token_hash = Column(String(64), nullable=False, unique=True)
+    criado_em = Column(DateTime, nullable=False, default=datetime.now)
+    expira_em = Column(Date, nullable=False)
+    ativo = Column(Integer, nullable=False, default=1)
+    criado_por = Column(String(100), nullable=True)
+    acessos = Column(Integer, nullable=False, default=0)
+    ultimo_acesso = Column(DateTime, nullable=True)
+    aluno = relationship("Aluno")
+
+
+class LogAuditoria(Base):
+    """Trilha de quem fez o quê (login, links, senhas, mensalidades, documentos)."""
+    __tablename__ = "log_auditoria"
+    id = Column(Integer, primary_key=True)
+    data_hora = Column(DateTime, nullable=False, default=datetime.now, index=True)
+    usuario = Column(String(100), nullable=True)
+    acao = Column(String(80), nullable=False)
+    detalhe = Column(Text, nullable=True)
 
 
 def backup_sqlite_automatico():
@@ -297,30 +364,42 @@ def backup_sqlite_automatico():
 
 # ============================================================
 # INICIALIZAÇÃO DO BANCO DE DADOS
+# Executada UMA vez por processo (cache_resource), e não a cada clique.
 # ============================================================
 
-try:
-    backup_sqlite_automatico()
+def aplicar_migracoes_aditivas():
+    """Adiciona somente colunas ausentes; nunca remove/reescreve dados existentes."""
+    colunas_novas = {
+        "area": "VARCHAR(100)",
+        "objetivo": "TEXT",
+        "data_prazo": "DATE",
+        "resultado": "TEXT",
+        "observacoes": "TEXT",
+    }
+    inspetor = inspect(engine)
+    if not inspetor.has_table("atividades_alunos"):
+        return
+    existentes = {c["name"] for c in inspetor.get_columns("atividades_alunos")}
+    for nome, tipo_sql in colunas_novas.items():
+        if nome not in existentes:
+            with engine.begin() as conexao:
+                conexao.execute(sql_text(
+                    f'ALTER TABLE atividades_alunos ADD COLUMN "{nome}" {tipo_sql}'
+                ))
 
-except Exception as exc:
-    print(f"[AVISO] Backup automático não concluído: {exc}")
 
-
-try:
-    # Cria somente tabelas inexistentes.
-    # Não exclui registros nem tabelas existentes.
+@st.cache_resource(show_spinner="Preparando o banco de dados...")
+def inicializar_banco():
+    """Backup diário (SQLite), criação de tabelas novas e migrações aditivas."""
+    try:
+        backup_sqlite_automatico()
+    except Exception as exc:
+        print(f"[AVISO] Backup automático não concluído: {exc}")
+    # Cria somente tabelas inexistentes (ex.: links_familiares, log_auditoria).
     Base.metadata.create_all(engine)
-
-except SQLAlchemyError as exc:
-    st.error(
-        "Não foi possível inicializar o banco de dados. "
-        "Verifique a conexão com o PostgreSQL e os Secrets."
-    )
-
-    print(f"[ERRO DATABASE] {exc}")
-
-    st.stop()
-
+    aplicar_migracoes_aditivas()
+    criar_usuario_admin_padrao()
+    return True
 
 
 # --------------------------- UTILITÁRIOS ---------------------
@@ -328,14 +407,36 @@ def limpar_cpf(cpf):
     return re.sub(r"\D", "", str(cpf or ""))
 
 
+SENHA_PADRAO_ADMIN = "admin123"
+PBKDF2_ITERACOES = 390_000
+PREFIXO_HASH = "pbkdf2_sha256$"
+CHAVES_SESSAO = ("usuario_id", "usuario_logado", "perfil_usuario", "trocar_senha_obrigatoria")
+
+
 def gerar_hash_senha(senha):
-    # Compatível com os hashes SHA-256 da versão anterior.
-    return hashlib.sha256(senha.encode("utf-8")).hexdigest()
+    """PBKDF2-SHA256 com sal aleatório (biblioteca padrão, sem dependências novas)."""
+    sal = secrets.token_bytes(16)
+    derivada = hashlib.pbkdf2_hmac("sha256", str(senha).encode("utf-8"), sal, PBKDF2_ITERACOES)
+    return f"{PREFIXO_HASH}{PBKDF2_ITERACOES}${sal.hex()}${derivada.hex()}"
+
+
+def hash_precisa_atualizar(senha_hash):
+    """Hashes SHA-256 da versão anterior são convertidos automaticamente no próximo login."""
+    return not str(senha_hash or "").startswith(PREFIXO_HASH)
 
 
 def verificar_senha(senha, senha_hash):
-    # Mantém compatibilidade com os usuários existentes.
-    return secrets.compare_digest(gerar_hash_senha(senha), senha_hash or "")
+    senha_hash = str(senha_hash or "")
+    senha_bytes = str(senha or "").encode("utf-8")
+    if senha_hash.startswith(PREFIXO_HASH):
+        try:
+            _, iteracoes, sal_hex, esperado = senha_hash.split("$", 3)
+            derivada = hashlib.pbkdf2_hmac("sha256", senha_bytes, bytes.fromhex(sal_hex), int(iteracoes))
+        except (ValueError, TypeError):
+            return False
+        return secrets.compare_digest(derivada.hex(), esperado)
+    # Compatibilidade com os hashes SHA-256 legados (sem sal).
+    return secrets.compare_digest(hashlib.sha256(senha_bytes).hexdigest(), senha_hash)
 
 
 def criar_usuario_admin_padrao():
@@ -345,13 +446,360 @@ def criar_usuario_admin_padrao():
             db.add(Usuario(
                 nome="Administrador Espaço Dinâmico",
                 cpf="00000000000",
-                senha_hash=gerar_hash_senha("admin123"),
+                senha_hash=gerar_hash_senha(SENHA_PADRAO_ADMIN),
                 perfil="Admin",
                 ativo=1,
             ))
             db.commit()
     finally:
         db.close()
+
+
+MAX_FALHAS_LOGIN = 5
+JANELA_BLOQUEIO_MIN = 10
+
+
+def referencia_cpf(cpf_limpo):
+    """Identificador do CPF para o log sem gravar o CPF em claro (LGPD)."""
+    return hash_token(f"login:{cpf_limpo}")[:16]
+
+
+def detalhe_falha_login(cpf_limpo):
+    if not cpf_limpo:
+        return "CPF vazio"
+    return f"CPF final {cpf_limpo[-3:]}; ref={referencia_cpf(cpf_limpo)}"
+
+
+def cpf_bloqueado(db, cpf_limpo):
+    """Bloqueia o CPF após MAX_FALHAS_LOGIN falhas na janela, contando no log de auditoria.
+
+    O bloqueio por session_state sozinho era zerado ao recarregar o navegador.
+    """
+    if not cpf_limpo:
+        return False
+    inicio = datetime.now() - timedelta(minutes=JANELA_BLOQUEIO_MIN)
+    try:
+        falhas = db.query(func.count(LogAuditoria.id)).filter(
+            LogAuditoria.acao == "login_falhou",
+            LogAuditoria.data_hora >= inicio,
+            LogAuditoria.detalhe.like(f"%ref={referencia_cpf(cpf_limpo)}%"),
+        ).scalar() or 0
+    except SQLAlchemyError as exc:
+        db.rollback()
+        print(f"[AVISO] Verificação de bloqueio de login falhou: {exc}")
+        return False
+    return falhas >= MAX_FALHAS_LOGIN
+
+
+def encerrar_sessao():
+    for chave in CHAVES_SESSAO:
+        st.session_state.pop(chave, None)
+
+
+def registrar_auditoria(acao, detalhe="", usuario=None):
+    """Grava um evento em sessão própria; falha de auditoria nunca derruba a tela."""
+    sessao = SessionLocal()
+    try:
+        sessao.add(LogAuditoria(
+            data_hora=datetime.now(), acao=str(acao)[:80], detalhe=str(detalhe or ""),
+            usuario=(usuario or st.session_state.get("usuario_logado") or "-")[:100],
+        ))
+        sessao.commit()
+    except Exception as exc:
+        sessao.rollback()
+        print(f"[AVISO] Auditoria não registrada ({acao}): {exc}")
+    finally:
+        sessao.close()
+
+
+# --------------------------- CONFIGURAÇÕES -------------------
+def config_padrao():
+    return {
+        "nome_instituicao": "Espaço Dinâmico",
+        "profissional_responsavel": "Larissa Lyrio",
+        "titulo_profissional": "Neuropsicopedagoga",
+        "app_url": os.getenv("APP_URL", ""),
+        # Usados nos recibos (opcionais).
+        "documento_profissional": "",
+        "cidade": "",
+    }
+
+
+def carregar_configuracoes(db):
+    valores = config_padrao()
+    itens = db.query(ConfiguracaoSistema).filter(ConfiguracaoSistema.chave.in_(list(valores))).all()
+    for item in itens:
+        if item.valor:
+            valores[item.chave] = item.valor
+    return valores
+
+
+# --------------------------- PERMISSÕES ----------------------
+MENU_PAGINAS = [
+    "📊 Painel", "👥 Alunos e responsáveis", "📄 Contratos",
+    "📂 Prontuários", "📁 Atividades", "🗄️ Guarda documental",
+    "💰 Financeiro", "📈 Desempenho", "👤 Usuários", "⚙️ Configurações",
+]
+
+# Ajuste aqui quem vê cada tela. Prontuários e documentos clínicos são
+# dados sensíveis (LGPD): o perfil Financeiro não tem acesso a eles.
+PERMISSOES = {
+    "Admin": set(MENU_PAGINAS),
+    "Profissional": {
+        "📊 Painel", "👥 Alunos e responsáveis", "📂 Prontuários", "📁 Atividades",
+        "🗄️ Guarda documental", "📈 Desempenho",
+    },
+    "Financeiro": {
+        "📊 Painel", "👥 Alunos e responsáveis", "📄 Contratos", "💰 Financeiro",
+    },
+}
+
+
+# --------------------------- ATIVIDADES ----------------------
+STATUS_CONCLUIDOS = ("Realizada", "Cancelada")
+
+
+def normalizar_status_atividade(status):
+    """Registros antigos usavam 'Realizado' (padrão do modelo); a tela usa 'Realizada'."""
+    return "Realizada" if status == "Realizado" else (status or "Planejada")
+
+
+# --------------------------- LINK DA FAMÍLIA -----------------
+def hash_token(token):
+    return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+
+
+def gerar_link_familiar(db, aluno_id, dias_validade, criado_por, revogar_anteriores=True):
+    """Gera token aleatório; no banco fica apenas o hash (o link não pode ser lido do banco)."""
+    token = secrets.token_urlsafe(32)
+    if revogar_anteriores:
+        db.query(LinkFamiliar).filter_by(aluno_id=aluno_id, ativo=1).update({"ativo": 0})
+    db.add(LinkFamiliar(
+        aluno_id=aluno_id, token_hash=hash_token(token), criado_em=datetime.now(),
+        expira_em=date.today() + timedelta(days=int(dias_validade)), ativo=1,
+        criado_por=criado_por, acessos=0,
+    ))
+    db.commit()
+    return token
+
+
+def validar_token_portal(db, token):
+    token = str(token or "").strip()
+    if not token or len(token) > 200:
+        return None
+    link = db.query(LinkFamiliar).filter_by(token_hash=hash_token(token), ativo=1).first()
+    if not link or not link.expira_em or link.expira_em < date.today():
+        return None
+    if not link.aluno or not link.aluno.ativo:
+        return None
+    return link
+
+
+def montar_url_portal(app_url, token):
+    base = str(app_url or "").strip().rstrip("/")
+    return f"{base}/?portal={token}" if base else f"?portal={token}"
+
+
+def detectar_url_base():
+    """Endereço (esquema + domínio) pelo qual o sistema foi aberto no navegador."""
+    try:
+        url = getattr(st.context, "url", None)
+        if url:
+            partes = urllib.parse.urlsplit(url)
+            if partes.scheme and partes.netloc:
+                return f"{partes.scheme}://{partes.netloc}"
+    except Exception:
+        pass
+    try:
+        host = st.context.headers.get("Host") or ""
+        if host:
+            esquema = "http" if eh_endereco_local(host) else "https"
+            return f"{esquema}://{host}"
+    except Exception:
+        pass
+    return ""
+
+
+def eh_endereco_local(url):
+    texto = str(url or "").lower()
+    return any(h in texto for h in ("localhost", "127.0.0.1", "0.0.0.0", "192.168.", "10.0."))
+
+
+def link_whatsapp(telefone, texto):
+    digitos = re.sub(r"\D", "", str(telefone or ""))
+    if len(digitos) in (10, 11):
+        digitos = "55" + digitos
+    if len(digitos) < 12:
+        return None
+    return f"https://wa.me/{digitos}?text={urllib.parse.quote(texto)}"
+
+
+def formatar_data_hora(valor):
+    if isinstance(valor, datetime):
+        return valor.strftime("%d/%m/%Y %H:%M")
+    return para_str_br(valor)
+
+
+# --------------------------- FINANCEIRO ----------------------
+MESES = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho",
+         "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
+
+
+def resumo_financeiro(db, referencia=None):
+    hoje = referencia or date.today()
+    inicio = hoje.replace(day=1)
+    fim = date(hoje.year, hoje.month, calendar.monthrange(hoje.year, hoje.month)[1])
+    L = LancamentoFinanceiro
+
+    def soma(*filtros):
+        valor = db.query(func.coalesce(func.sum(L.valor), 0)).filter(*filtros).scalar()
+        return float(valor or 0)
+
+    atraso = (L.tipo == "Receita", L.status == "Pendente", L.data_vencimento < hoje)
+    recebido = soma(L.tipo == "Receita", L.status == "Pago", L.data_pagamento.between(inicio, fim))
+    despesas = soma(L.tipo == "Despesa", L.status == "Pago", L.data_pagamento.between(inicio, fim))
+    return {
+        "a_receber": soma(L.tipo == "Receita", L.status == "Pendente", L.data_vencimento >= hoje),
+        "em_atraso": soma(*atraso),
+        "qtd_atraso": db.query(func.count(L.id)).filter(*atraso).scalar() or 0,
+        "recebido_mes": recebido,
+        "despesas_mes": despesas,
+        "saldo_mes": recebido - despesas,
+    }
+
+
+# --------------------------- RECIBOS -------------------------
+_UNIDADES = ["zero", "um", "dois", "três", "quatro", "cinco", "seis", "sete", "oito", "nove", "dez",
+             "onze", "doze", "treze", "catorze", "quinze", "dezesseis", "dezessete", "dezoito", "dezenove"]
+_DEZENAS = ["", "", "vinte", "trinta", "quarenta", "cinquenta", "sessenta", "setenta", "oitenta", "noventa"]
+_CENTENAS = ["", "cento", "duzentos", "trezentos", "quatrocentos", "quinhentos",
+             "seiscentos", "setecentos", "oitocentos", "novecentos"]
+
+
+def _extenso_ate_999(n):
+    if n == 100:
+        return "cem"
+    centena, resto = divmod(n, 100)
+    partes = [_CENTENAS[centena]] if centena else []
+    if resto:
+        if resto < 20:
+            partes.append(_UNIDADES[resto])
+        else:
+            dezena, unidade = divmod(resto, 10)
+            partes.append(_DEZENAS[dezena] + (f" e {_UNIDADES[unidade]}" if unidade else ""))
+    return " e ".join(partes)
+
+
+def extenso_inteiro(n):
+    n = int(n)
+    if n == 0:
+        return "zero"
+    milhoes, resto = divmod(n, 1_000_000)
+    milhares, unidades = divmod(resto, 1000)
+    grupos = []
+    if milhoes:
+        grupos.append("um milhão" if milhoes == 1 else f"{_extenso_ate_999(milhoes)} milhões")
+    if milhares:
+        grupos.append("mil" if milhares == 1 else f"{_extenso_ate_999(milhares)} mil")
+    if unidades:
+        # Regra do português: "mil e cinquenta", "mil e trezentos", mas "mil trezentos e dez".
+        ultimo = _extenso_ate_999(unidades)
+        if grupos and (unidades < 100 or unidades % 100 == 0):
+            return " ".join(grupos) + " e " + ultimo
+        grupos.append(ultimo)
+    return " ".join(grupos)
+
+
+def valor_por_extenso(valor):
+    total_centavos = int(round(float(valor or 0) * 100))
+    reais, centavos = divmod(total_centavos, 100)
+    partes = []
+    if reais:
+        sufixo = "real" if reais == 1 else "reais"
+        if reais >= 1_000_000 and reais % 1_000_000 == 0:
+            sufixo = "de reais"
+        partes.append(f"{extenso_inteiro(reais)} {sufixo}")
+    if centavos:
+        partes.append(f"{extenso_inteiro(centavos)} {'centavo' if centavos == 1 else 'centavos'}")
+    return " e ".join(partes) if partes else "zero real"
+
+
+def data_por_extenso(d):
+    return f"{d.day} de {MESES[d.month - 1].lower()} de {d.year}"
+
+
+def gerar_recibo_pdf(lanc, cfg, logo=None):
+    """Recibo em PDF (A4) de um lançamento de Receita já pago."""
+    from io import BytesIO
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
+    from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    from reportlab.lib import colors
+
+    esc = lambda v: html.escape(str(v or ""))
+    aluno = lanc.aluno
+    responsavel = aluno.responsavel if aluno else None
+    pagador = responsavel.nome if responsavel else (aluno.nome if aluno else "—")
+    data_pag = lanc.data_pagamento or date.today()
+    numero = f"{lanc.id:06d}"
+
+    base = ParagraphStyle("base", fontName="Helvetica", fontSize=11.5, leading=17, textColor=colors.HexColor("#172b4d"))
+    titulo = ParagraphStyle("titulo", parent=base, fontName="Helvetica-Bold", fontSize=20, leading=24, alignment=TA_CENTER)
+    centro = ParagraphStyle("centro", parent=base, alignment=TA_CENTER, fontSize=10, textColor=colors.HexColor("#64748b"))
+    corpo = ParagraphStyle("corpo", parent=base, alignment=TA_JUSTIFY, fontSize=12.5, leading=21)
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=2.2 * cm, rightMargin=2.2 * cm,
+                            topMargin=1.8 * cm, bottomMargin=1.8 * cm,
+                            title=f"Recibo {numero}", author=cfg["nome_instituicao"])
+    elementos = []
+    if logo and os.path.isfile(logo):
+        try:
+            elementos += [Image(logo, width=2.6 * cm, height=2.6 * cm, kind="proportional"), Spacer(1, 6)]
+        except Exception as exc:
+            print(f"[AVISO] Logo não incluída no recibo: {exc}")
+    elementos.append(Paragraph(esc(cfg["nome_instituicao"]), ParagraphStyle("inst", parent=titulo, fontSize=15)))
+    linha_prof = f"{esc(cfg['profissional_responsavel'])} · {esc(cfg['titulo_profissional'])}"
+    if cfg.get("documento_profissional"):
+        linha_prof += f" · {esc(cfg['documento_profissional'])}"
+    elementos += [Paragraph(linha_prof, centro), Spacer(1, 22)]
+
+    cabecalho_tab = Table([[Paragraph(f"<b>RECIBO Nº {numero}</b>", ParagraphStyle("n", parent=base, fontSize=14)),
+                            Paragraph(f"<b>{esc(moeda(lanc.valor))}</b>",
+                                      ParagraphStyle("v", parent=base, fontSize=14, alignment=2))]],
+                          colWidths=["60%", "40%"])
+    cabecalho_tab.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#087e8b")),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#e8f7f6")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 10), ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+        ("LEFTPADDING", (0, 0), (-1, -1), 12), ("RIGHTPADDING", (0, 0), (-1, -1), 12),
+    ]))
+    elementos += [cabecalho_tab, Spacer(1, 24)]
+
+    referente = esc(lanc.descricao)
+    if aluno:
+        referente += f", do(a) aluno(a) <b>{esc(aluno.nome)}</b>"
+    texto = (f"Recebi de <b>{esc(pagador)}</b> a importância de <b>{esc(moeda(lanc.valor))}</b> "
+             f"({esc(valor_por_extenso(lanc.valor))}), referente a {referente}, "
+             f"paga em {esc(para_str_br(data_pag))}.")
+    elementos += [Paragraph(texto, corpo), Spacer(1, 10),
+                  Paragraph("Para clareza, firmo o presente recibo, dando plena quitação do valor acima.", corpo),
+                  Spacer(1, 34)]
+    local = f"{esc(cfg['cidade'])}, " if cfg.get("cidade") else ""
+    elementos += [Paragraph(f"{local}{esc(data_por_extenso(data_pag))}.", base), Spacer(1, 64)]
+
+    assinatura = Table([[""], [Paragraph(f"<b>{esc(cfg['profissional_responsavel'])}</b><br/>{esc(cfg['titulo_profissional'])}",
+                                         ParagraphStyle("ass", parent=base, alignment=TA_CENTER, fontSize=10.5, leading=14))]],
+                       colWidths=[9 * cm])
+    assinatura.setStyle(TableStyle([("LINEABOVE", (0, 1), (0, 1), 0.8, colors.HexColor("#172b4d")),
+                                    ("TOPPADDING", (0, 1), (0, 1), 6)]))
+    elementos.append(assinatura)
+    elementos += [Spacer(1, 40), Paragraph(f"Documento gerado pelo sistema em {datetime.now():%d/%m/%Y %H:%M}.", centro)]
+    doc.build(elementos)
+    return buffer.getvalue()
 
 
 def obter_logo():
@@ -390,6 +838,120 @@ def mensagem_erro(exc, contexto="operação"):
     st.error(f"Não foi possível concluir a {contexto}. Verifique os dados e tente novamente.")
     # Detalhe técnico apenas no terminal; não expõe informações internas na tela.
     print(f"[ERRO] {contexto}: {exc}")
+
+
+def obter_config_storage():
+    """Lê credenciais privadas do Supabase exclusivamente no servidor."""
+    try:
+        cfg = st.secrets.get("supabase", {})
+    except Exception:
+        cfg = {}
+    url = str(cfg.get("url", os.getenv("SUPABASE_URL", ""))).strip().rstrip("/")
+    chave = str(cfg.get("service_role_key", os.getenv("SUPABASE_SERVICE_ROLE_KEY", ""))).strip()
+    bucket = str(cfg.get("bucket", "documentos-clinicos")).strip()
+    if not url or not chave:
+        return None
+    return {"url": url, "key": chave, "bucket": bucket}
+
+
+def requisicao_storage(metodo, endpoint, payload=None, content_type="application/json"):
+    cfg = obter_config_storage()
+    if not cfg:
+        raise RuntimeError("Storage não configurado. Configure [supabase] nos Secrets do Streamlit.")
+    url = f"{cfg['url']}/storage/v1/{endpoint.lstrip('/')}"
+    corpo = payload
+    if isinstance(payload, dict):
+        corpo = json.dumps(payload).encode("utf-8")
+    headers = {
+        "apikey": cfg["key"],
+        "Authorization": f"Bearer {cfg['key']}",
+        "Content-Type": content_type,
+    }
+    req = urllib.request.Request(url, data=corpo, headers=headers, method=metodo)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resposta:
+            bruto = resposta.read()
+            return json.loads(bruto.decode("utf-8")) if bruto else {}
+    except urllib.error.HTTPError as exc:
+        detalhe = exc.read().decode("utf-8", errors="replace")[:1000]
+        raise RuntimeError(f"Supabase Storage retornou HTTP {exc.code}: {detalhe}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Falha de comunicação com Supabase Storage: {exc.reason}") from exc
+
+
+LIMITE_PDF_BYTES = 20 * 1024 * 1024
+
+
+def diagnosticar_storage():
+    """Confere credenciais e bucket. Retorna (situacao, mensagem).
+
+    situacao: "sem_config", "erro", "sem_bucket", "publico" ou "ok".
+    """
+    cfg = obter_config_storage()
+    if not cfg:
+        return "sem_config", "Credenciais [supabase] não encontradas nos Secrets."
+    try:
+        buckets = requisicao_storage("GET", "bucket")
+    except RuntimeError as exc:
+        texto = str(exc)
+        if "HTTP 401" in texto or "HTTP 403" in texto:
+            return "erro", "O Supabase recusou a chave. Confira se é a service_role (secret) key do projeto correto."
+        return "erro", "Não foi possível falar com o Supabase. Confira a URL do projeto e a internet."
+    bucket = next((b for b in buckets or [] if b.get("id") == cfg["bucket"] or b.get("name") == cfg["bucket"]), None)
+    if not bucket:
+        return "sem_bucket", f"Conexão OK, mas o bucket '{cfg['bucket']}' ainda não existe."
+    if bucket.get("public"):
+        return "publico", (f"O bucket '{cfg['bucket']}' está PÚBLICO: qualquer pessoa com o endereço abre os PDFs. "
+                           "No Supabase, edite o bucket e desmarque 'Public bucket'.")
+    return "ok", f"Armazenamento pronto: bucket privado '{cfg['bucket']}'."
+
+
+def criar_bucket_privado():
+    """Cria o bucket PRIVADO, aceitando só PDF até 20 MB."""
+    cfg = obter_config_storage()
+    return requisicao_storage("POST", "bucket", {
+        "id": cfg["bucket"], "name": cfg["bucket"], "public": False,
+        "file_size_limit": LIMITE_PDF_BYTES, "allowed_mime_types": ["application/pdf"],
+    })
+
+
+def enviar_pdf_storage(caminho, conteudo):
+    cfg = obter_config_storage()
+    if not cfg:
+        raise RuntimeError("Configure as credenciais do Supabase Storage antes de importar documentos.")
+    endpoint = f"object/{urllib.parse.quote(cfg['bucket'], safe='')}/{urllib.parse.quote(caminho, safe='/')}"
+    return requisicao_storage("POST", endpoint, conteudo, "application/pdf")
+
+
+def gerar_link_pdf(caminho, validade_segundos=600):
+    cfg = obter_config_storage()
+    if not cfg:
+        raise RuntimeError("Storage não configurado.")
+    endpoint = f"object/sign/{urllib.parse.quote(cfg['bucket'], safe='')}/{urllib.parse.quote(caminho, safe='/')}"
+    resposta = requisicao_storage("POST", endpoint, {"expiresIn": int(validade_segundos)})
+    link = resposta.get("signedURL") or resposta.get("signedUrl")
+    if not link:
+        raise RuntimeError("O Supabase não retornou o link temporário do documento.")
+    if link.startswith("http://") or link.startswith("https://"):
+        return link
+    return f"{cfg['url']}/storage/v1{link if link.startswith('/') else '/' + link}"
+
+
+def excluir_objeto_storage(caminho):
+    cfg = obter_config_storage()
+    if not cfg:
+        return
+    endpoint = f"object/{urllib.parse.quote(cfg['bucket'], safe='')}"
+    requisicao_storage("DELETE", endpoint, {"prefixes": [caminho]})
+
+
+def formatar_tamanho(bytes_total):
+    valor = float(bytes_total or 0)
+    for unidade in ("B", "KB", "MB", "GB"):
+        if valor < 1024 or unidade == "GB":
+            return f"{valor:.1f} {unidade}"
+        valor /= 1024
+    return f"{valor:.1f} GB"
 
 
 def normalizar_texto(valor):
@@ -548,7 +1110,8 @@ def aplicar_estilo_global():
     """, unsafe_allow_html=True)
 
 
-def cabecalho(logo):
+def cabecalho(logo, cfg=None):
+    cfg = cfg or config_padrao()
     # Cabecalho em bloco unico HTML.
     logo_html = ""
     if logo and os.path.isfile(logo):
@@ -565,8 +1128,8 @@ def cabecalho(logo):
         logo_html = '<div class="ed-header-logo" aria-label="Espaço Dinâmico"><span style="font-size:2.5rem">🧩</span></div>'
     bloco = f'''<section class="ed-header" role="banner">
       {logo_html}
-      <div class="ed-header-title"><h1>Espaço Dinâmico</h1><p>Sistema Integrado de Gestão Neuropsicopedagógica</p></div>
-      <div class="ed-profissional"><strong>Larissa Lyrio</strong><span>Neuropsicopedagoga</span></div>
+      <div class="ed-header-title"><h1>{html.escape(cfg["nome_instituicao"])}</h1><p>Sistema Integrado de Gestão Neuropsicopedagógica</p></div>
+      <div class="ed-profissional"><strong>{html.escape(cfg["profissional_responsavel"])}</strong><span>{html.escape(cfg["titulo_profissional"])}</span></div>
     </section>'''
     st.markdown(bloco, unsafe_allow_html=True)
 
@@ -600,12 +1163,12 @@ def exibir_grafico_barras_fino(df, categoria, valor, titulo, chave):
         xaxis={"title": None, "showgrid": True, "gridcolor": "#e8edf4", "zeroline": False, "rangemode": "tozero", "automargin": True},
         yaxis={"title": None, "showgrid": False, "automargin": True, "tickfont": {"size": 11}},
         hoverlabel={"bgcolor": "#142b4a", "font": {"color": "#ffffff"}})
-    st.plotly_chart(fig, use_container_width=True, key=chave,
+    st.plotly_chart(fig, width="stretch", key=chave,
                     config={"displayModeBar": False, "responsive": True})
 
 
 # --------------------------- LOGIN ---------------------------
-def renderizar_tela_login(db, logo):
+def renderizar_tela_login(db, logo, cfg):
     aplicar_estilo_global()
     st.markdown("<div style='height:3vh'></div>", unsafe_allow_html=True)
     esquerda, centro, direita = st.columns([1, 1.25, 1])
@@ -613,49 +1176,93 @@ def renderizar_tela_login(db, logo):
         if logo:
             _, imgcol, _ = st.columns([1, 1, 1])
             with imgcol:
-                st.image(logo, use_container_width=True)
-        st.markdown("<h1 style='text-align:center;color:#142b4a'>Espaço Dinâmico</h1>", unsafe_allow_html=True)
-        st.markdown("<p style='text-align:center;color:#64748b'>Larissa Lyrio · Neuropsicopedagoga</p>", unsafe_allow_html=True)
+                st.image(logo, width="stretch")
+        st.markdown(f"<h1 style='text-align:center;color:#142b4a'>{html.escape(cfg['nome_instituicao'])}</h1>", unsafe_allow_html=True)
+        st.markdown(
+            f"<p style='text-align:center;color:#64748b'>{html.escape(cfg['profissional_responsavel'])} · "
+            f"{html.escape(cfg['titulo_profissional'])}</p>", unsafe_allow_html=True)
         with st.container(border=True):
             st.subheader("🔐 Acesso ao sistema")
+            restante = int(st.session_state.get("login_bloqueado_ate", 0) - time.time())
             with st.form("form_login", clear_on_submit=False):
                 cpf = st.text_input("CPF", max_chars=14, placeholder="Digite apenas os números")
                 senha = st.text_input("Senha", type="password")
-                enviar = st.form_submit_button("Entrar", use_container_width=True, type="primary")
-            if enviar:
-                usuario = db.query(Usuario).filter(Usuario.cpf == limpar_cpf(cpf)).first()
+                enviar = st.form_submit_button("Entrar", width="stretch", type="primary")
+            cpf_limpo = limpar_cpf(cpf) if enviar else ""
+            if enviar and restante > 0:
+                st.warning(f"Muitas tentativas incorretas. Aguarde {restante} segundos e tente novamente.")
+            elif enviar and cpf_bloqueado(db, cpf_limpo):
+                # Bloqueio gravado no banco: recarregar a página não zera as tentativas.
+                st.warning(f"Muitas tentativas incorretas para este CPF. Aguarde {JANELA_BLOQUEIO_MIN} minutos e tente novamente.")
+            elif enviar:
+                usuario = db.query(Usuario).filter(Usuario.cpf == cpf_limpo).first()
                 if usuario and usuario.ativo == 1 and verificar_senha(senha, usuario.senha_hash):
+                    if hash_precisa_atualizar(usuario.senha_hash):
+                        try:
+                            usuario.senha_hash = gerar_hash_senha(senha)
+                            db.commit()
+                        except SQLAlchemyError as exc:
+                            db.rollback()
+                            print(f"[AVISO] Não foi possível atualizar o hash da senha: {exc}")
+                    st.session_state.pop("login_tentativas", None)
+                    st.session_state.pop("login_bloqueado_ate", None)
                     st.session_state["usuario_id"] = usuario.id
                     st.session_state["usuario_logado"] = usuario.nome
                     st.session_state["perfil_usuario"] = usuario.perfil
+                    # Senha padrão ou curta: exige troca antes de liberar o sistema.
+                    st.session_state["trocar_senha_obrigatoria"] = (senha == SENHA_PADRAO_ADMIN or len(senha) < 8)
+                    registrar_auditoria("login", usuario=usuario.nome)
                     st.rerun()
                 else:
-                    st.error("CPF ou senha incorretos, ou usuário inativo.")
-        st.caption("A sessão desta versão é mantida pelo Streamlit. Login persistente após recarregar o navegador requer configuração adicional de autenticação/cookies.")
+                    time.sleep(1)  # desacelera tentativas automáticas
+                    tentativas = st.session_state.get("login_tentativas", 0) + 1
+                    st.session_state["login_tentativas"] = tentativas
+                    registrar_auditoria("login_falhou", detalhe_falha_login(cpf_limpo), usuario="-")
+                    if tentativas >= 5:
+                        st.session_state["login_bloqueado_ate"] = time.time() + 120
+                        st.session_state["login_tentativas"] = 0
+                        st.error("Muitas tentativas incorretas. O acesso foi bloqueado por 2 minutos.")
+                    else:
+                        st.error("CPF ou senha incorretos, ou usuário inativo.")
+        st.caption("A sessão é mantida pelo Streamlit. Ao recarregar o navegador, será necessário entrar novamente.")
 
 
 # --------------------------- TELAS ---------------------------
-def tela_painel(db):
+def tela_painel(db, perfil):
     st.title("Painel de gestão")
-    alunos = db.query(Aluno).filter_by(ativo=1).count()
-    responsaveis = db.query(Responsavel).count()
-    contratos = db.query(Contrato).filter_by(status="Ativo").count()
-    prontuarios = db.query(Prontuario).count()
-    receitas_pendentes = db.query(LancamentoFinanceiro).filter_by(tipo="Receita", status="Pendente").all()
-    c1, c2, c3, c4, c5 = st.columns(5)
+    hoje = date.today()
+    alunos = db.query(func.count(Aluno.id)).filter(Aluno.ativo == 1).scalar() or 0
+    responsaveis = db.query(func.count(Responsavel.id)).scalar() or 0
+    contratos = db.query(func.count(Contrato.id)).filter(Contrato.status == "Ativo").scalar() or 0
+    atividades_vencidas = db.query(func.count(AtividadeAluno.id)).filter(
+        AtividadeAluno.data_prazo < hoje,
+        or_(AtividadeAluno.status.is_(None),
+            ~AtividadeAluno.status.in_(["Realizada", "Realizado", "Cancelada"])),
+    ).scalar() or 0
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Alunos ativos", alunos)
     c2.metric("Responsáveis", responsaveis)
     c3.metric("Contratos ativos", contratos)
-    c4.metric("Registros de prontuário", prontuarios)
-    c5.metric("Receitas pendentes", moeda(sum(x.valor for x in receitas_pendentes)))
+    c4.metric("Atividades com prazo vencido", atividades_vencidas)
+
+    if perfil in ("Admin", "Financeiro"):
+        r = resumo_financeiro(db, hoje)
+        st.subheader(f"Financeiro — {MESES[hoje.month - 1]}/{hoje.year}")
+        f1, f2, f3, f4 = st.columns(4)
+        f1.metric("A receber (em dia)", moeda(r["a_receber"]))
+        f2.metric("Em atraso", moeda(r["em_atraso"]), f"{r['qtd_atraso']} lançamento(s)", delta_color="inverse" if r["qtd_atraso"] else "off")
+        f3.metric("Recebido no mês", moeda(r["recebido_mes"]))
+        f4.metric("Saldo do mês", moeda(r["saldo_mes"]))
+
     st.subheader("Alunos cadastrados")
-    lista = db.query(Aluno).filter_by(ativo=1).order_by(Aluno.nome).all()
+    lista = (db.query(Aluno).options(joinedload(Aluno.responsavel))
+             .filter(Aluno.ativo == 1).order_by(Aluno.nome).all())
     if lista:
         st.dataframe(pd.DataFrame([{
             "ID": a.id, "Aluno": a.nome, "Nascimento": para_str_br(a.data_nascimento),
             "Idade": calcular_idade(a.data_nascimento), "Escolaridade": a.escolaridade or "-",
             "Responsável": a.responsavel.nome if a.responsavel else "-",
-        } for a in lista]), use_container_width=True, hide_index=True)
+        } for a in lista]), width="stretch", hide_index=True)
     else:
         st.info("Nenhum aluno ativo cadastrado.")
 
@@ -725,7 +1332,8 @@ def tela_cadastros(db):
             atual_resp = next((k for k, v in resp_map.items() if v == aluno.responsavel_id), "Não informado")
             with st.form(f"f_editar_aluno_{aluno.id}"):
                 nome_edit = st.text_input("Nome", value=aluno.nome)
-                nasc_edit = st.date_input("Nascimento", value=aluno.data_nascimento or date.today(), min_value=date(1900, 1, 1), max_value=date.today(), format="DD/MM/YYYY")
+                # Sem "or date.today()": antes, salvar um aluno sem nascimento gravava a data de hoje.
+                nasc_edit = st.date_input("Nascimento", value=aluno.data_nascimento, min_value=date(1900, 1, 1), max_value=date.today(), format="DD/MM/YYYY")
                 esc_edit = st.text_input("Escolaridade", value=aluno.escolaridade or "")
                 resp_edit = st.selectbox("Responsável", list(resp_map), index=list(resp_map).index(atual_resp))
                 ativo_edit = st.checkbox("Aluno ativo", value=bool(aluno.ativo))
@@ -747,17 +1355,17 @@ def tela_cadastros(db):
                         db.rollback()
                         mensagem_erro(exc, "edição do aluno")
             st.caption("A inativação preserva prontuários, contratos, atividades e lançamentos vinculados.")
-            if aluno.ativo:
-                if st.button("Inativar aluno", key=f"inativar_aluno_{aluno.id}"):
-                    aluno.ativo = 0
+            rotulo = "Inativar aluno" if aluno.ativo else "Reativar aluno"
+            if st.button(rotulo, key=f"alternar_ativo_aluno_{aluno.id}"):
+                novo_estado = 0 if aluno.ativo else 1
+                try:
+                    aluno.ativo = novo_estado
                     db.commit()
-                    st.success("Aluno inativado; histórico preservado.")
-                    st.rerun()
-            else:
-                if st.button("Reativar aluno", key=f"reativar_aluno_{aluno.id}"):
-                    aluno.ativo = 1
-                    db.commit()
-                    st.success("Aluno reativado.")
+                except SQLAlchemyError as exc:
+                    db.rollback()
+                    mensagem_erro(exc, "alteração da situação do aluno")
+                else:
+                    registrar_auditoria("aluno_inativado" if not novo_estado else "aluno_reativado", f"aluno_id={aluno.id}")
                     st.rerun()
 
     with tab4:
@@ -768,7 +1376,7 @@ def tela_cadastros(db):
             st.dataframe(pd.DataFrame([{
                 "ID": r.id, "Nome": r.nome, "Telefone": r.telefone or "", "E-mail": r.email or "",
                 "Alunos vinculados": len(r.alunos)
-            } for r in responsaveis]), use_container_width=True, hide_index=True)
+            } for r in responsaveis]), width="stretch", hide_index=True)
             mapa_r = {f"{r.id} — {r.nome}": r.id for r in responsaveis}
             escolha_r = st.selectbox("Selecione o responsável para editar", list(mapa_r), key="gerenciar_resp_sel")
             responsavel = db.get(Responsavel, mapa_r[escolha_r])
@@ -809,11 +1417,65 @@ def tela_cadastros(db):
                         db.rollback()
                         mensagem_erro(exc, "exclusão do responsável")
 
+def tela_gerar_mensalidades(db):
+    st.markdown("Gera os lançamentos de **Receita / Mensalidade** de todos os contratos ativos na competência escolhida. "
+                "Lançamentos já existentes são ignorados, então a geração pode ser repetida sem duplicar.")
+    hoje = date.today()
+    c1, c2 = st.columns(2)
+    mes = c1.selectbox("Mês", list(range(1, 13)), index=hoje.month - 1, format_func=lambda m: MESES[m - 1], key="gm_mes")
+    ano = int(c2.number_input("Ano", min_value=2020, max_value=2100, value=hoje.year, step=1, key="gm_ano"))
+    ultimo_dia = calendar.monthrange(ano, mes)[1]
+    fim_mes = date(ano, mes, ultimo_dia)
+    contratos = (db.query(Contrato).options(joinedload(Contrato.aluno))
+                 .filter(Contrato.status == "Ativo").order_by(Contrato.id).all())
+    previstos = []
+    for c in contratos:
+        if not c.aluno or not c.aluno.ativo or not c.valor_mensalidade:
+            continue
+        if c.data_inicio and c.data_inicio > fim_mes:
+            continue
+        descricao = f"Mensalidade {mes:02d}/{ano} — contrato #{c.id}"
+        existe = db.query(LancamentoFinanceiro.id).filter_by(aluno_id=c.aluno_id, descricao=descricao).first() is not None
+        # Dia 31 em mês de 30 dias (ou fevereiro) vira o último dia do mês.
+        vencimento = date(ano, mes, min(int(c.dia_vencimento or 10), ultimo_dia))
+        previstos.append({"contrato": c, "descricao": descricao, "vencimento": vencimento, "existe": existe})
+    if not previstos:
+        st.info("Nenhum contrato ativo elegível para esta competência.")
+        return
+    novos = [p for p in previstos if not p["existe"]]
+    st.dataframe(pd.DataFrame([{
+        "Contrato": p["contrato"].id, "Aluno": p["contrato"].aluno.nome,
+        "Valor": moeda(p["contrato"].valor_mensalidade), "Vencimento": para_str_br(p["vencimento"]),
+        "Situação": "Já lançado" if p["existe"] else "Será gerado",
+    } for p in previstos]), width="stretch", hide_index=True)
+    st.caption(f"{len(novos)} novo(s) lançamento(s) — total {moeda(sum(p['contrato'].valor_mensalidade for p in novos))}.")
+    if st.button(f"Gerar {len(novos)} lançamento(s)", type="primary", disabled=not novos, key="gm_gerar"):
+        try:
+            for p in novos:
+                c = p["contrato"]
+                db.add(LancamentoFinanceiro(
+                    aluno_id=c.aluno_id, tipo="Receita", descricao=p["descricao"], categoria="Mensalidade",
+                    valor=float(c.valor_mensalidade), data_vencimento=p["vencimento"], status="Pendente",
+                    observacao=f"Gerado automaticamente a partir do contrato #{c.id}.",
+                ))
+            db.commit()
+        except SQLAlchemyError as exc:
+            db.rollback()
+            mensagem_erro(exc, "geração das mensalidades")
+            return
+        registrar_auditoria("mensalidades_geradas", f"competência {mes:02d}/{ano}: {len(novos)} lançamento(s)")
+        st.success(f"{len(novos)} mensalidade(s) gerada(s). Confira em 💰 Financeiro.")
+        st.rerun()
+
+
 def tela_contratos(db):
     st.title("Contratos e mensalidades")
     alunos = db.query(Aluno).filter_by(ativo=1).order_by(Aluno.nome).all()
     mapa = {f"{a.id} — {a.nome}": a.id for a in alunos}
-    tab1, tab2 = st.tabs(["➕ Novo contrato", "✏️ Consultar e gerenciar contratos"])
+    tab1, tab2, tab3 = st.tabs(["➕ Novo contrato", "✏️ Consultar e gerenciar contratos", "🧾 Gerar mensalidades"])
+    # tab3 é renderizada antes porque tab2 encerra a função quando não há contratos.
+    with tab3:
+        tela_gerar_mensalidades(db)
     with tab1:
         if not mapa:
             st.info("Cadastre um aluno ativo antes de criar um contrato.")
@@ -847,7 +1509,7 @@ def tela_contratos(db):
             "ID": c.id, "Aluno": c.aluno.nome if c.aluno else "Aluno não localizado",
             "Serviço": c.descricao_servico or "", "Mensalidade": moeda(c.valor_mensalidade),
             "Vencimento": f"Dia {c.dia_vencimento}", "Início": para_str_br(c.data_inicio), "Status": c.status
-        } for c in contratos]), use_container_width=True, hide_index=True)
+        } for c in contratos]), width="stretch", hide_index=True)
         cmap = {f"{c.id} — {c.aluno.nome if c.aluno else 'Aluno não localizado'} — {c.status}": c.id for c in contratos}
         selecionado = st.selectbox("Selecione o contrato para editar", list(cmap), key="contrato_editar_sel")
         contrato = db.get(Contrato, cmap[selecionado])
@@ -914,7 +1576,7 @@ def tela_prontuario(db):
             st.dataframe(pd.DataFrame([{
                 "ID": p.id, "Data": para_str_br(p.data_registro),
                 "Queixa / observações": p.queixa_principal or "", "Hipóteses": p.hipotese_diagnostica or "", "Conduta": p.conduta or ""
-            } for p in registros]), use_container_width=True, hide_index=True)
+            } for p in registros]), width="stretch", hide_index=True)
             mapa_p = {f"Registro #{p.id} — {para_str_br(p.data_registro)}": p.id for p in registros}
             escolha_p = st.selectbox("Selecione a evolução para editar", list(mapa_p), key=f"prontuario_editar_{aluno_id}")
             p = db.get(Prontuario, mapa_p[escolha_p])
@@ -943,36 +1605,49 @@ def tela_prontuario(db):
 
 def tela_atividades(db):
     st.title("Atividades pedagógicas")
+    st.caption("Planejamento, execução e acompanhamento individual das atividades.")
     alunos = db.query(Aluno).order_by(Aluno.nome).all()
     if not alunos:
         st.info("Cadastre um aluno antes de registrar atividades.")
         return
     mapa = {f"{a.id} — {a.nome}{'' if a.ativo else ' (inativo)'}": a.id for a in alunos}
-    categorias = ["Intervenção", "Leitura", "Escrita", "Matemática", "Atenção", "Memória", "Outro"]
-    status_opcoes = ["Planejada", "Realizada", "Reagendada", "Cancelada"]
-    tab1, tab2 = st.tabs(["➕ Nova atividade", "✏️ Consultar e gerenciar atividades"])
+    categorias = ["Intervenção", "Leitura", "Escrita", "Matemática", "Atenção", "Memória", "Linguagem", "Coordenação motora", "Outro"]
+    status_opcoes = ["Planejada", "Em andamento", "Realizada", "Reagendada", "Cancelada"]
+    tab1, tab2, tab3 = st.tabs(["➕ Nova atividade", "📋 Consultar e editar", "📊 Acompanhamento"])
     with tab1:
-        alunos_ativos = {k: v for k, v in mapa.items() if db.get(Aluno, v).ativo}
-        if not alunos_ativos:
+        ativos = {f"{a.id} — {a.nome}": a.id for a in alunos if a.ativo}
+        if not ativos:
             st.info("Não há alunos ativos para vincular à nova atividade.")
         else:
-            with st.form("f_atividade_nova", clear_on_submit=True):
-                aluno_sel = st.selectbox("Aluno", list(alunos_ativos))
+            with st.form("f_atividade_nova_v2", clear_on_submit=True):
+                aluno_sel = st.selectbox("Aluno", list(ativos))
                 titulo = st.text_input("Título da atividade *")
-                categoria = st.selectbox("Categoria", categorias)
-                data_atividade = st.date_input("Data", value=date.today(), format="DD/MM/YYYY")
-                descricao = st.text_area("Descrição / objetivo / observações")
-                status = st.selectbox("Situação", status_opcoes, index=1)
+                c1, c2 = st.columns(2)
+                with c1:
+                    categoria = st.selectbox("Categoria", categorias)
+                    area = st.text_input("Área / habilidade trabalhada")
+                    data_atividade = st.date_input("Data prevista / realizada", value=date.today(), format="DD/MM/YYYY")
+                with c2:
+                    status = st.selectbox("Situação", status_opcoes, index=0)
+                    prazo = st.date_input("Prazo (opcional)", value=None, format="DD/MM/YYYY")
+                objetivo = st.text_area("Objetivo pedagógico")
+                descricao = st.text_area("Descrição / etapas / materiais")
+                resultado = st.text_area("Resultado / desempenho observado")
+                observacoes = st.text_area("Observações para acompanhamento")
                 salvar = st.form_submit_button("Salvar atividade", type="primary")
             if salvar:
                 if not titulo.strip():
                     st.error("Informe o título da atividade.")
                 else:
                     try:
-                        db.add(AtividadeAluno(aluno_id=alunos_ativos[aluno_sel], titulo=titulo.strip(), categoria=categoria,
-                                              data_atividade=data_atividade, descricao=descricao.strip(), status=status))
+                        db.add(AtividadeAluno(
+                            aluno_id=ativos[aluno_sel], titulo=titulo.strip(), categoria=categoria,
+                            area=area.strip(), data_atividade=data_atividade, data_prazo=prazo,
+                            objetivo=objetivo.strip(), descricao=descricao.strip(), resultado=resultado.strip(),
+                            observacoes=observacoes.strip(), status=status
+                        ))
                         db.commit()
-                        st.success("Atividade registrada.")
+                        st.success("Atividade registrada com sucesso.")
                         st.rerun()
                     except SQLAlchemyError as exc:
                         db.rollback()
@@ -981,197 +1656,565 @@ def tela_atividades(db):
         registros = db.query(AtividadeAluno).order_by(AtividadeAluno.data_atividade.desc(), AtividadeAluno.id.desc()).all()
         if not registros:
             st.info("Nenhuma atividade registrada.")
-            return
-        filtro_aluno = st.selectbox("Filtrar por aluno", ["Todos"] + list(mapa), key="filtro_atividades_aluno")
-        filtro_status = st.selectbox("Filtrar situação", ["Todas"] + status_opcoes, key="filtro_atividades_status")
-        filtrados = registros
-        if filtro_aluno != "Todos":
-            filtrados = [r for r in filtrados if r.aluno_id == mapa[filtro_aluno]]
-        if filtro_status != "Todas":
-            filtrados = [r for r in filtrados if r.status == filtro_status]
-        st.dataframe(pd.DataFrame([{
-            "ID": r.id, "Aluno": r.aluno.nome if r.aluno else "-", "Data": para_str_br(r.data_atividade),
-            "Título": r.titulo, "Categoria": r.categoria, "Situação": r.status, "Descrição": r.descricao or ""
-        } for r in filtrados]), use_container_width=True, hide_index=True)
-        if filtrados:
-            mapa_ativ = {f"#{r.id} — {r.aluno.nome if r.aluno else '-'} — {r.titulo} — {para_str_br(r.data_atividade)}": r.id for r in filtrados}
-            escolha = st.selectbox("Selecione a atividade para editar", list(mapa_ativ), key="atividade_editar_sel")
-            atividade = db.get(AtividadeAluno, mapa_ativ[escolha])
-            with st.form(f"f_editar_atividade_{atividade.id}"):
-                aluno_e = st.selectbox("Aluno", list(mapa), index=list(mapa.values()).index(atividade.aluno_id))
-                titulo_e = st.text_input("Título", value=atividade.titulo)
-                cat_atual = atividade.categoria if atividade.categoria in categorias else "Outro"
-                cat_e = st.selectbox("Categoria", categorias, index=categorias.index(cat_atual))
-                data_e = st.date_input("Data", value=atividade.data_atividade or date.today(), format="DD/MM/YYYY")
-                desc_e = st.text_area("Descrição / objetivo / observações", value=atividade.descricao or "")
-                st_atual = atividade.status if atividade.status in status_opcoes else "Planejada"
-                status_e = st.selectbox("Situação", status_opcoes, index=status_opcoes.index(st_atual))
-                salvar_e = st.form_submit_button("Salvar alterações", type="primary")
-            if salvar_e:
-                if not titulo_e.strip():
-                    st.error("O título é obrigatório.")
-                else:
-                    atividade.aluno_id = mapa[aluno_e]
-                    atividade.titulo = titulo_e.strip()
-                    atividade.categoria = cat_e
-                    atividade.data_atividade = data_e
-                    atividade.descricao = desc_e.strip()
-                    atividade.status = status_e
-                    try:
-                        db.commit()
-                        st.success("Atividade atualizada.")
-                        st.rerun()
-                    except SQLAlchemyError as exc:
-                        db.rollback()
-                        mensagem_erro(exc, "edição da atividade")
-            st.caption("Para preservar o histórico, use a situação Cancelada em vez de excluir definitivamente uma atividade.")
-
-def tela_desempenho(db):
-    st.title("Desempenho e planilha mestre")
-    st.caption("Análise qualitativa por aluno, com evolução cronológica, distribuição das classificações e frequência das dificuldades.")
-    cfg = db.query(ConfiguracaoSistema).filter_by(chave="link_planilha_mestre").first()
-    link_atual = cfg.valor if cfg else ""
-    with st.form("f_mestre"):
-        st.write("Configure uma única vez o link da planilha mestre do Google Sheets. A aba esperada é OBSERVAÇÃO DO ATENDIMENTO.")
-        novo_link = st.text_input("Link da planilha", value=link_atual or "")
-        salvar = st.form_submit_button("Salvar configuração", type="primary")
-    if salvar:
-        if novo_link.strip() and "docs.google.com/spreadsheets" not in novo_link:
-            st.error("Informe um link válido do Google Sheets.")
         else:
-            if cfg:
-                cfg.valor = novo_link.strip()
-            else:
-                db.add(ConfiguracaoSistema(chave="link_planilha_mestre", valor=novo_link.strip()))
-            db.commit()
-            carregar_planilha_observacao_atendimento.clear()
-            st.success("Configuração salva.")
-            st.rerun()
-    st.divider()
-    alunos = db.query(Aluno).filter_by(ativo=1).order_by(Aluno.nome).all()
-    if not link_atual:
-        st.info("Configure a planilha para consultar os indicadores.")
+            c1, c2 = st.columns(2)
+            with c1:
+                filtro_aluno = st.selectbox("Aluno", ["Todos"] + list(mapa), key="filtro_atividades_aluno_v2")
+            with c2:
+                filtro_status = st.selectbox("Situação", ["Todas"] + status_opcoes, key="filtro_atividades_status_v2")
+            filtrados = registros
+            if filtro_aluno != "Todos":
+                filtrados = [r for r in filtrados if r.aluno_id == mapa[filtro_aluno]]
+            if filtro_status != "Todas":
+                filtrados = [r for r in filtrados if normalizar_status_atividade(r.status) == filtro_status]
+            st.dataframe(pd.DataFrame([{
+                "ID": r.id, "Aluno": r.aluno.nome if r.aluno else "-", "Data": para_str_br(r.data_atividade),
+                "Prazo": para_str_br(r.data_prazo), "Título": r.titulo, "Área": r.area or r.categoria,
+                "Situação": normalizar_status_atividade(r.status)
+            } for r in filtrados]), width="stretch", hide_index=True)
+            if filtrados:
+                opcoes = {f"#{r.id} — {r.aluno.nome if r.aluno else '-'} — {r.titulo}": r.id for r in filtrados}
+                escolha = st.selectbox("Selecione para editar", list(opcoes), key="atividade_editar_sel_v2")
+                atividade = db.get(AtividadeAluno, opcoes[escolha])
+                aluno_atual = next((k for k, v in mapa.items() if v == atividade.aluno_id), list(mapa)[0])
+                cat_atual = atividade.categoria if atividade.categoria in categorias else "Outro"
+                # Antes, registros "Realizado" viravam "Planejada" ao serem editados.
+                st_norm = normalizar_status_atividade(atividade.status)
+                st_atual = st_norm if st_norm in status_opcoes else "Planejada"
+                with st.form(f"f_editar_atividade_v2_{atividade.id}"):
+                    aluno_e = st.selectbox("Aluno", list(mapa), index=list(mapa).index(aluno_atual))
+                    titulo_e = st.text_input("Título", value=atividade.titulo or "")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        cat_e = st.selectbox("Categoria", categorias, index=categorias.index(cat_atual))
+                        area_e = st.text_input("Área / habilidade", value=atividade.area or "")
+                        data_e = st.date_input("Data", value=atividade.data_atividade or date.today(), format="DD/MM/YYYY")
+                    with c2:
+                        status_e = st.selectbox("Situação", status_opcoes, index=status_opcoes.index(st_atual))
+                        prazo_e = st.date_input("Prazo", value=atividade.data_prazo, format="DD/MM/YYYY")
+                    objetivo_e = st.text_area("Objetivo pedagógico", value=atividade.objetivo or "")
+                    desc_e = st.text_area("Descrição / etapas / materiais", value=atividade.descricao or "")
+                    resultado_e = st.text_area("Resultado / desempenho observado", value=atividade.resultado or "")
+                    obs_e = st.text_area("Observações", value=atividade.observacoes or "")
+                    salvar_e = st.form_submit_button("Salvar alterações", type="primary")
+                if salvar_e:
+                    if not titulo_e.strip():
+                        st.error("O título é obrigatório.")
+                    else:
+                        try:
+                            atividade.aluno_id = mapa[aluno_e]
+                            atividade.titulo = titulo_e.strip()
+                            atividade.categoria = cat_e
+                            atividade.area = area_e.strip()
+                            atividade.data_atividade = data_e
+                            atividade.data_prazo = prazo_e
+                            atividade.status = status_e
+                            atividade.objetivo = objetivo_e.strip()
+                            atividade.descricao = desc_e.strip()
+                            atividade.resultado = resultado_e.strip()
+                            atividade.observacoes = obs_e.strip()
+                            db.commit()
+                            st.success("Atividade atualizada.")
+                            st.rerun()
+                        except SQLAlchemyError as exc:
+                            db.rollback()
+                            mensagem_erro(exc, "edição da atividade")
+                st.caption("O histórico não é apagado: utilize Cancelada para atividades que não serão executadas.")
+    with tab3:
+        todos = db.query(AtividadeAluno).all()
+        if todos:
+            total = len(todos)
+            planejadas = sum(1 for a in todos if normalizar_status_atividade(a.status) == "Planejada")
+            andamento = sum(1 for a in todos if normalizar_status_atividade(a.status) == "Em andamento")
+            realizadas = sum(1 for a in todos if normalizar_status_atividade(a.status) == "Realizada")
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Total", total)
+            k2.metric("Planejadas", planejadas)
+            k3.metric("Em andamento", andamento)
+            k4.metric("Realizadas", realizadas)
+            atrasadas = [a for a in todos if a.data_prazo and a.data_prazo < date.today() and normalizar_status_atividade(a.status) not in STATUS_CONCLUIDOS]
+            if atrasadas:
+                st.warning(f"Existem {len(atrasadas)} atividade(s) com prazo vencido.")
+                st.dataframe(pd.DataFrame([{"Aluno": a.aluno.nome if a.aluno else "-", "Atividade": a.titulo,
+                    "Prazo": para_str_br(a.data_prazo), "Situação": normalizar_status_atividade(a.status)} for a in atrasadas]), width="stretch", hide_index=True)
+        else:
+            st.info("Ainda não há atividades para consolidar.")
+
+
+def tela_guarda_documental(db, usuario):
+    st.title("Guarda documental")
+    st.caption("Repositório privado de documentos PDF vinculados aos alunos.")
+    if usuario.perfil not in ("Admin", "Profissional"):
+        st.error("Acesso restrito aos perfis Admin e Profissional.")
         return
-    if not alunos:
-        st.info("Cadastre alunos antes de consultar indicadores.")
-        return
-    mapa = {f"{a.id} — {a.nome}": a.nome for a in alunos}
-    selecionado = st.selectbox("Aluno para análise", list(mapa.keys()))
-    nome_aluno = mapa[selecionado]
-    if st.button("🔄 Atualizar dados da planilha"):
-        carregar_planilha_observacao_atendimento.clear()
-    with st.spinner("Lendo a planilha mestre..."):
-        df = carregar_planilha_observacao_atendimento(link_atual)
-    if df is None:
-        st.error("Não foi possível ler a planilha. Confira se o link está correto e se a planilha permite leitura pelo link.")
-        st.caption("Se a planilha exigir login institucional, a importação CSV pública pode não funcionar; será necessário configurar autenticação compatível.")
-        return
-    if df.empty:
-        st.warning("A aba foi lida, mas não contém registros.")
-        return
-    df_aluno, indicadores = filtrar_e_analisar_aluno(df, nome_aluno)
-    if df_aluno.empty:
-        col_nome = localizar_coluna(df, ("nome", "aluno")) or localizar_coluna(df, ("nome",))
-        st.warning(f"Nenhum registro encontrado para {nome_aluno}. Confira a grafia do nome na coluna '{col_nome or 'Nome'}'.")
-        with st.expander("Diagnóstico da importação"):
-            st.write(f"Linhas importadas: {len(df)}")
-            st.write("Colunas identificadas:")
-            st.code("\n".join(str(c) for c in df.columns))
+    cfg = obter_config_storage()
+    if not cfg:
+        st.warning("O armazenamento ainda não está configurado. Cadastre as credenciais privadas do Supabase nos Secrets para habilitar os envios.")
+        st.markdown(
+            "1. No Supabase: **Project Settings → API**. Copie a *Project URL* e a chave **service_role** (secret).\n"
+            "2. No computador: preencha `.streamlit/secrets.toml`. No Streamlit Cloud: **App → Settings → Secrets**.\n"
+            "3. Reinicie o app e volte aqui: o sistema confere a conexão e cria o bucket privado.")
+        st.code('[supabase]\nurl = "https://SEU-PROJETO.supabase.co"\nservice_role_key = "SUA_SERVICE_ROLE_KEY"\nbucket = "documentos-clinicos"', language="toml")
+        st.info("Não publique a service_role_key nem a coloque no código do GitHub: ela dá acesso total ao projeto.")
         return
 
-    # Cards de resumo sem transformar classificações em notas numéricas.
-    st.success(f"{len(df_aluno)} registro(s) encontrado(s) para {nome_aluno}.")
+    # Diagnóstico guardado na sessão para não consultar o Supabase a cada clique.
+    if "storage_diagnostico" not in st.session_state:
+        st.session_state["storage_diagnostico"] = diagnosticar_storage()
+    situacao, msg = st.session_state["storage_diagnostico"]
+    with st.expander("☁️ Situação do armazenamento", expanded=situacao != "ok"):
+        {"ok": st.success, "publico": st.error, "sem_bucket": st.warning}.get(situacao, st.error)(msg)
+        b1, b2 = st.columns(2)
+        if b1.button("🔄 Verificar novamente", key="storage_verificar", width="stretch"):
+            st.session_state.pop("storage_diagnostico", None)
+            st.rerun()
+        if situacao == "sem_bucket" and usuario.perfil == "Admin":
+            if b2.button("Criar bucket privado agora", key="storage_criar_bucket", type="primary", width="stretch"):
+                try:
+                    criar_bucket_privado()
+                except RuntimeError as exc:
+                    mensagem_erro(exc, "criação do bucket")
+                else:
+                    registrar_auditoria("storage_bucket_criado", cfg["bucket"], usuario.nome)
+                    st.session_state.pop("storage_diagnostico", None)
+                    st.rerun()
+    # Bucket público expõe documentos clínicos (LGPD): envios ficam bloqueados até corrigir.
+    if situacao in ("erro", "sem_bucket", "publico"):
+        if situacao == "sem_bucket" and usuario.perfil != "Admin":
+            st.info("Peça a um administrador para criar o bucket nesta tela.")
+        return
+    alunos = db.query(Aluno).order_by(Aluno.nome).all()
+    if not alunos:
+        st.info("Cadastre um aluno antes de arquivar documentos.")
+        return
+    mapa = {f"{a.id} — {a.nome}{'' if a.ativo else ' (inativo)'}": a.id for a in alunos}
+    categorias = ["Contrato e termos", "Avaliação", "Relatório", "Laudo recebido", "Autorização", "Documento escolar", "Comprovante", "Outros"]
+    tab1, tab2 = st.tabs(["⬆️ Importar PDF", "🗂️ Consultar documentos"])
+    with tab1:
+        st.markdown("**Importação segura** · PDF até 20 MB · armazenamento privado na nuvem.")
+        with st.form("f_upload_documento", clear_on_submit=True):
+            aluno_sel = st.selectbox("Vincular ao aluno", list(mapa))
+            titulo = st.text_input("Título do documento *")
+            categoria = st.selectbox("Categoria documental", categorias)
+            data_doc = st.date_input("Data do documento", value=date.today(), format="DD/MM/YYYY")
+            descricao = st.text_area("Descrição / observações")
+            arquivo = st.file_uploader("Selecione o arquivo PDF", type=["pdf"], accept_multiple_files=False)
+            enviar = st.form_submit_button("Enviar e arquivar PDF", type="primary")
+        if enviar:
+            if not titulo.strip() or arquivo is None:
+                st.error("Informe o título e selecione um arquivo PDF.")
+            else:
+                conteudo = arquivo.getvalue()
+                if len(conteudo) > LIMITE_PDF_BYTES:
+                    st.error("O arquivo excede o limite de 20 MB.")
+                elif not conteudo.startswith(b"%PDF-"):
+                    st.error("O arquivo selecionado não possui assinatura válida de PDF.")
+                else:
+                    digest = hashlib.sha256(conteudo).hexdigest()
+                    duplicado = db.query(DocumentoAluno).filter_by(aluno_id=mapa[aluno_sel], sha256=digest, status="Ativo").first()
+                    if duplicado:
+                        st.warning(f"Este mesmo arquivo já está arquivado como '{duplicado.titulo}' (documento #{duplicado.id}).")
+                    else:
+                        ext_nome = Path(arquivo.name).name[:180]
+                        caminho = f"alunos/{mapa[aluno_sel]}/{uuid.uuid4().hex}.pdf"
+                        enviado_storage = False
+                        try:
+                            enviar_pdf_storage(caminho, conteudo)
+                            enviado_storage = True
+                            documento = DocumentoAluno(
+                                aluno_id=mapa[aluno_sel], titulo=titulo.strip(), categoria=categoria,
+                                descricao=descricao.strip(), nome_original=ext_nome,
+                                caminho_storage=caminho, mime_type="application/pdf", tamanho_bytes=len(conteudo),
+                                sha256=digest, status="Ativo", criado_em=data_doc,
+                                criado_por=usuario.nome
+                            )
+                            db.add(documento)
+                            db.commit()
+                            st.success("PDF enviado e registrado na guarda documental.")
+                            st.rerun()
+                        except Exception as exc:
+                            db.rollback()
+                            if enviado_storage:
+                                try:
+                                    excluir_objeto_storage(caminho)
+                                except Exception as limpeza_exc:
+                                    print(f"[AVISO] Falha ao limpar arquivo órfão: {limpeza_exc}")
+                            mensagem_erro(exc, "importação do documento")
+    with tab2:
+        documentos = db.query(DocumentoAluno).order_by(DocumentoAluno.criado_em.desc(), DocumentoAluno.id.desc()).all()
+        filtro_aluno = st.selectbox("Filtrar aluno", ["Todos"] + list(mapa), key="docs_filtro_aluno")
+        filtro_categoria = st.selectbox("Categoria", ["Todas"] + categorias, key="docs_filtro_categoria")
+        incluir_arquivados = st.checkbox("Incluir documentos arquivados", value=False)
+        filtrados = documentos
+        if filtro_aluno != "Todos":
+            filtrados = [d for d in filtrados if d.aluno_id == mapa[filtro_aluno]]
+        if filtro_categoria != "Todas":
+            filtrados = [d for d in filtrados if d.categoria == filtro_categoria]
+        if not incluir_arquivados:
+            filtrados = [d for d in filtrados if d.status == "Ativo"]
+        if filtrados:
+            st.dataframe(pd.DataFrame([{
+                "ID": d.id, "Aluno": d.aluno.nome if d.aluno else "-", "Título": d.titulo,
+                "Categoria": d.categoria, "Data": para_str_br(d.criado_em),
+                "Arquivo": d.nome_original, "Tamanho": formatar_tamanho(d.tamanho_bytes),
+                "Situação": d.status, "Incluído por": d.criado_por or "-"
+            } for d in filtrados]), width="stretch", hide_index=True)
+            opcoes = {f"#{d.id} — {d.aluno.nome if d.aluno else '-'} — {d.titulo} ({d.status})": d.id for d in filtrados}
+            selecionado = st.selectbox("Documento", list(opcoes), key="doc_selecionado")
+            doc = db.get(DocumentoAluno, opcoes[selecionado])
+            c1, c2 = st.columns(2)
+            with c1:
+                # O link só é gerado quando solicitado (antes era gerado a cada clique na tela).
+                chave_link = f"link_doc_{doc.id}"
+                if st.button("Gerar link temporário (10 min)", key=f"btn_{chave_link}", width="stretch"):
+                    try:
+                        st.session_state[chave_link] = gerar_link_pdf(doc.caminho_storage)
+                        registrar_auditoria("documento_aberto", f"documento_id={doc.id}", usuario.nome)
+                    except Exception as exc:
+                        mensagem_erro(exc, "geração do acesso ao PDF")
+                if st.session_state.get(chave_link):
+                    st.link_button("Abrir PDF", st.session_state[chave_link], width="stretch")
+            with c2:
+                if doc.status == "Ativo":
+                    confirmar = st.checkbox("Confirmo o arquivamento deste documento", key=f"confirmar_arq_doc_{doc.id}")
+                    if st.button("Arquivar documento", key=f"arquivar_doc_{doc.id}", disabled=not confirmar):
+                        doc.status = "Arquivado"
+                        try:
+                            db.commit()
+                            st.success("Documento arquivado. O arquivo original foi preservado no Storage.")
+                            st.rerun()
+                        except SQLAlchemyError as exc:
+                            db.rollback()
+                            mensagem_erro(exc, "arquivamento do documento")
+            with st.expander("Detalhes do documento"):
+                st.write("**Descrição:**", doc.descricao or "Não informada")
+                st.write("**SHA-256:**", doc.sha256)
+                st.write("**Tamanho:**", formatar_tamanho(doc.tamanho_bytes))
+                st.write("**Caminho interno:**", doc.caminho_storage)
+        else:
+            st.info("Nenhum documento encontrado com os filtros selecionados.")
+
+
+VALORES_VAZIOS = {"", "nan", "none", "-", "—", "não informado", "nao informado"}
+
+
+def limpar_respostas(serie):
+    texto = serie.astype(str).str.strip()
+    return texto[~texto.str.casefold().isin(VALORES_VAZIOS)]
+
+
+def obter_link_planilha(db):
+    cfg = db.query(ConfiguracaoSistema).filter_by(chave="link_planilha_mestre").first()
+    return (cfg.valor or "").strip() if cfg else ""
+
+
+def renderizar_analise_desempenho(df_aluno, indicadores, nome_aluno, prefixo, publico=False):
+    """Análise qualitativa reutilizada na tela interna e no portal da família.
+
+    publico=True oculta a tabela bruta da planilha e a exportação CSV, para que
+    a família veja apenas os indicadores consolidados.
+    """
     col_data = localizar_coluna(df_aluno, ("data",), excluir=("carimbo",))
     col_compreensao = localizar_coluna(df_aluno, ("compreensão",)) or localizar_coluna(df_aluno, ("compreensao",))
     col_dificuldades = localizar_coluna(df_aluno, ("dificuldades",))
     col_conteudo = localizar_coluna(df_aluno, ("conteúdo trabalhado",)) or localizar_coluna(df_aluno, ("conteudo trabalhado",))
+
+    datas = (pd.to_datetime(df_aluno[col_data], dayfirst=True, errors="coerce").dropna()
+             if col_data else pd.Series(dtype="datetime64[ns]"))
     c1, c2, c3 = st.columns(3)
-    c1.metric("Registros encontrados", len(df_aluno))
-    if col_data:
-        datas = pd.to_datetime(df_aluno[col_data], dayfirst=True, errors="coerce").dropna()
-        c2.metric("Primeiro atendimento", datas.min().strftime("%d/%m/%Y") if not datas.empty else "—")
-        c3.metric("Atendimento mais recente", datas.max().strftime("%d/%m/%Y") if not datas.empty else "—")
+    c1.metric("Atendimentos registrados", len(df_aluno))
+    c2.metric("Primeiro atendimento", datas.min().strftime("%d/%m/%Y") if not datas.empty else "—")
+    c3.metric("Atendimento mais recente", datas.max().strftime("%d/%m/%Y") if not datas.empty else "—")
+
+    if not publico:
+        with st.expander("📋 Registros importados do aluno", expanded=False):
+            tabela = preparar_datas_planilha(df_aluno)
+            st.dataframe(tabela, width="stretch", hide_index=True)
+            nome_arquivo = re.sub(r"[^0-9A-Za-z]+", "_", nome_aluno).strip("_").lower() or "aluno"
+            st.download_button("Exportar registros deste aluno (CSV)",
+                               data=tabela.to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"desempenho_{nome_arquivo}.csv", mime="text/csv",
+                               key=f"{prefixo}_csv")
+
+    st.subheader("📊 Distribuição das classificações")
+    escolhas = [c for c in indicadores if not limpar_respostas(df_aluno[c]).empty]
+    if escolhas:
+        indicador_sel = st.selectbox("Indicador para analisar", escolhas, key=f"{prefixo}_indicador")
+        contagem = (limpar_respostas(df_aluno[indicador_sel]).value_counts()
+                    .rename_axis("Classificação").reset_index(name="Quantidade"))
+        exibir_grafico_barras_fino(contagem, "Classificação", "Quantidade",
+                                   f"Classificações — {indicador_sel}", f"{prefixo}_graf_class")
+        if not publico:
+            st.dataframe(contagem, width="stretch", hide_index=True)
     else:
-        c2.metric("Datas identificadas", "Não localizada")
-        c3.metric("Indicadores", len(indicadores))
+        st.info("Ainda não há indicadores de participação preenchidos.")
 
-    with st.expander("📋 Registros importados do aluno", expanded=True):
-        st.dataframe(preparar_datas_planilha(df_aluno), use_container_width=True, hide_index=True)
-        csv_aluno = preparar_datas_planilha(df_aluno).to_csv(index=False).encode("utf-8-sig")
-        st.download_button("Exportar registros deste aluno (CSV)", data=csv_aluno,
-                           file_name="desempenho_aluno.csv", mime="text/csv")
-
-    st.subheader("📊 Distribuição das classificações qualitativas")
-    if indicadores:
-        escolhas = [c for c in indicadores if df_aluno[c].astype(str).str.strip().ne("").any()]
-        if escolhas:
-            indicador_sel = st.selectbox("Indicador para analisar", escolhas, key="indicador_qualitativo")
-            distribuicao = df_aluno[indicador_sel].astype(str).str.strip()
-            distribuicao = distribuicao[~distribuicao.str.casefold().isin(["", "nan", "none", "-", "não informado", "nao informado"])]
-            if not distribuicao.empty:
-                contagem = distribuicao.value_counts().rename_axis("Classificação").reset_index(name="Quantidade")
-                exibir_grafico_barras_fino(contagem, "Classificação", "Quantidade", f"Classificações — {indicador_sel}", "grafico_classificacoes")
-                st.dataframe(contagem, use_container_width=True, hide_index=True)
-            else:
-                st.info("O indicador selecionado não possui respostas preenchidas.")
+    st.subheader("📈 Evolução por atendimento")
+    if col_data and escolhas:
+        df_ev = df_aluno.copy()
+        df_ev["Data do atendimento"] = pd.to_datetime(df_ev[col_data], dayfirst=True, errors="coerce")
+        df_ev = df_ev.dropna(subset=["Data do atendimento"]).sort_values("Data do atendimento")
+        if not df_ev.empty:
+            tabela_ev = df_ev[["Data do atendimento"] + escolhas].copy()
+            tabela_ev["Data do atendimento"] = tabela_ev["Data do atendimento"].dt.strftime("%d/%m/%Y")
+            st.dataframe(tabela_ev, width="stretch", hide_index=True)
+            st.caption("Histórico qualitativo: as classificações não são convertidas em notas nem em escala artificial.")
         else:
-            st.info("As colunas F a M foram identificadas, mas não possuem respostas preenchidas para este aluno.")
-
-        st.subheader("📈 Evolução por data de atendimento")
-        if col_data:
-            df_evolucao = df_aluno.copy()
-            df_evolucao["Data do atendimento"] = pd.to_datetime(df_evolucao[col_data], dayfirst=True, errors="coerce")
-            df_evolucao = df_evolucao.dropna(subset=["Data do atendimento"]).sort_values("Data do atendimento")
-            if not df_evolucao.empty:
-                # Exibe as classificações como registros qualitativos por atendimento, sem inventar escala numérica.
-                colunas_evolucao = [c for c in indicadores if df_evolucao[c].astype(str).str.strip().ne("").any()]
-                if colunas_evolucao:
-                    tabela_evolucao = df_evolucao[["Data do atendimento"] + colunas_evolucao].copy()
-                    tabela_evolucao["Data do atendimento"] = tabela_evolucao["Data do atendimento"].dt.strftime("%d/%m/%Y")
-                    st.dataframe(tabela_evolucao, use_container_width=True, hide_index=True)
-                    st.caption("A evolução é apresentada como histórico qualitativo. As classificações não são convertidas em notas nem em uma escala artificial.")
-                else:
-                    st.info("Não há indicadores preenchidos para mostrar a evolução.")
-            else:
-                st.info("Não foram reconhecidas datas válidas na coluna de data do atendimento.")
-        else:
-            st.info("Não foi identificada uma coluna de data de atendimento para ordenar a evolução.")
+            st.info("Não foram reconhecidas datas válidas nos atendimentos.")
     else:
-        st.warning("Não foi possível localizar as colunas de indicadores F a M. Confira a estrutura da aba de origem.")
+        st.info("Ainda não há dados suficientes para mostrar a evolução.")
 
     if col_compreensao:
-        st.subheader("🧠 Compreensão do conteúdo")
-        comp = df_aluno[col_compreensao].astype(str).str.strip()
-        comp = comp[~comp.str.casefold().isin(["", "nan", "none", "-"])]
+        comp = limpar_respostas(df_aluno[col_compreensao])
         if not comp.empty:
+            st.subheader("🧠 Compreensão do conteúdo")
             comp_count = comp.value_counts().rename_axis("Resposta").reset_index(name="Quantidade")
-            exibir_grafico_barras_fino(comp_count, "Resposta", "Quantidade", "Respostas sobre compreensão", "grafico_compreensao")
-            st.dataframe(comp_count, use_container_width=True, hide_index=True)
-        else:
-            st.info("Não há respostas de compreensão preenchidas.")
+            exibir_grafico_barras_fino(comp_count, "Resposta", "Quantidade",
+                                       "Respostas sobre compreensão", f"{prefixo}_graf_comp")
 
     if col_dificuldades:
-        st.subheader("🎯 Frequência das dificuldades relatadas")
         dificuldades = dividir_categorias(df_aluno[col_dificuldades])
         if not dificuldades.empty:
+            st.subheader("🎯 Dificuldades observadas")
             df_dif = dificuldades.rename_axis("Dificuldade").reset_index(name="Ocorrências")
-            exibir_grafico_barras_fino(df_dif, "Dificuldade", "Ocorrências", "Frequência das dificuldades relatadas", "grafico_dificuldades")
-            st.dataframe(df_dif, use_container_width=True, hide_index=True)
-            st.caption("As respostas com várias dificuldades separadas por vírgula ou ponto e vírgula são divididas em categorias para contabilização.")
-        else:
-            st.info("Não há dificuldades preenchidas para este aluno.")
+            exibir_grafico_barras_fino(df_dif, "Dificuldade", "Ocorrências",
+                                       "Frequência das dificuldades observadas", f"{prefixo}_graf_dif")
 
     if col_conteudo:
-        with st.expander("📚 Conteúdos trabalhados"):
-            conteudos = df_aluno[col_conteudo].astype(str).str.strip()
-            conteudos = conteudos[~conteudos.str.casefold().isin(["", "nan", "none", "-"])]
-            for idx, conteudo in enumerate(conteudos, start=1):
-                st.markdown(f"**Registro {idx}:** {conteudo}")
-    st.info("O link da planilha mestre é compartilhado por todos os alunos. O filtro usa o nome completo normalizado. Os dados pedagógicos são apresentados qualitativamente, sem atribuir notas não definidas pela profissional.")
+        conteudos = limpar_respostas(df_aluno[col_conteudo])
+        if not conteudos.empty:
+            with st.expander("📚 Conteúdos trabalhados"):
+                for idx, conteudo in enumerate(conteudos, start=1):
+                    st.markdown(f"**Atendimento {idx}:** {conteudo}")
+
+
+def _analise_interna(alunos, link_planilha):
+    mapa = {f"{a.id} — {a.nome}": a for a in alunos}
+    selecionado = st.selectbox("Aluno para análise", list(mapa), key="desempenho_aluno")
+    aluno = mapa[selecionado]
+    if st.button("🔄 Atualizar dados da planilha"):
+        carregar_planilha_observacao_atendimento.clear()
+    with st.spinner("Lendo a planilha mestre..."):
+        df = carregar_planilha_observacao_atendimento(link_planilha)
+    if df is None:
+        st.error("Não foi possível ler a planilha. Confira se o link está correto e se a planilha permite leitura pelo link.")
+        return
+    if df.empty:
+        st.warning("A aba foi lida, mas não contém registros.")
+        return
+    df_aluno, indicadores = filtrar_e_analisar_aluno(df, aluno.nome)
+    if df_aluno.empty:
+        col_nome = localizar_coluna(df, ("nome", "aluno")) or localizar_coluna(df, ("nome",))
+        st.warning(f"Nenhum registro encontrado para {aluno.nome}. Confira a grafia do nome na coluna '{col_nome or 'Nome'}'.")
+        with st.expander("Diagnóstico da importação"):
+            st.write(f"Linhas importadas: {len(df)}")
+            st.code("\n".join(str(c) for c in df.columns))
+        return
+    st.success(f"{len(df_aluno)} registro(s) encontrado(s) para {aluno.nome}.")
+    renderizar_analise_desempenho(df_aluno, indicadores, aluno.nome, "interno")
+
+
+def tela_links_familiares(db, usuario, alunos):
+    cfg = carregar_configuracoes(db)
+    # Usa a URL cadastrada; se não houver, detecta o endereço pelo qual o sistema está aberto.
+    app_url = cfg.get("app_url", "") or detectar_url_base()
+    local = eh_endereco_local(app_url)
+    st.markdown(
+        "Gere um **link individual** para a família acompanhar o desempenho, sem login. "
+        "A família vê somente: indicadores de participação, evolução, compreensão, dificuldades, "
+        "conteúdos trabalhados e atividades. **Prontuário, hipóteses, documentos e financeiro nunca aparecem.**"
+    )
+    if not app_url:
+        st.warning("Não foi possível identificar o endereço do sistema. Cadastre a URL pública em ⚙️ Configurações "
+                   "(ex.: https://espacodinamico.streamlit.app).")
+    elif local:
+        st.warning(f"O sistema está rodando no seu computador ({app_url}). Os links gerados aqui servem para **testar**, "
+                   "mas só abrem nesta máquina. Para a família acessar, publique o app (Streamlit Cloud) e gere o link por lá.")
+
+    mapa = {f"{a.id} — {a.nome}": a for a in alunos}
+    with st.form("f_gerar_link_familiar"):
+        aluno_sel = st.selectbox("Aluno", list(mapa))
+        validade = st.selectbox("Validade", [30, 90, 180, 365], index=2, format_func=lambda d: f"{d} dias")
+        revogar = st.checkbox("Revogar links anteriores deste aluno", value=True)
+        gerar = st.form_submit_button("Gerar link", type="primary")
+    if gerar:
+        aluno = mapa[aluno_sel]
+        try:
+            token = gerar_link_familiar(db, aluno.id, validade, usuario.nome, revogar)
+        except SQLAlchemyError as exc:
+            db.rollback()
+            mensagem_erro(exc, "geração do link")
+        else:
+            st.session_state["ultimo_link_gerado"] = {
+                "aluno_id": aluno.id, "aluno": aluno.nome,
+                "url": montar_url_portal(app_url, token),
+                "validade": para_str_br(date.today() + timedelta(days=validade)),
+            }
+            registrar_auditoria("link_familiar_gerado", f"aluno_id={aluno.id}; validade={validade} dias", usuario.nome)
+
+    gerado = st.session_state.get("ultimo_link_gerado")
+    if gerado:
+        st.success(f"Link gerado para {gerado['aluno']} — válido até {gerado['validade']}.")
+        st.code(gerado["url"], language=None)
+        st.caption("Copie agora (ícone no canto do quadro): por segurança o sistema guarda apenas uma impressão "
+                   "criptográfica do link e não consegue exibi-lo de novo. Se perder, gere outro.")
+        aluno_obj = db.get(Aluno, gerado["aluno_id"])
+        telefone = aluno_obj.responsavel.telefone if aluno_obj and aluno_obj.responsavel else ""
+        if gerado["url"].startswith("http"):
+            st.link_button("👁️ Abrir o portal da família (testar)", gerado["url"])
+        if app_url and not local:
+            texto = (f"Olá! Segue o link para acompanhar o desenvolvimento de {gerado['aluno']} "
+                     f"no {cfg['nome_instituicao']}: {gerado['url']} (válido até {gerado['validade']}). "
+                     "Este link é pessoal, por favor não compartilhe.")
+            wa = link_whatsapp(telefone, texto)
+            if wa:
+                st.link_button("📲 Enviar ao responsável pelo WhatsApp", wa)
+
+    st.divider()
+    st.subheader("Links emitidos")
+    links = (db.query(LinkFamiliar).options(joinedload(LinkFamiliar.aluno))
+             .order_by(LinkFamiliar.criado_em.desc()).limit(200).all())
+    if not links:
+        st.info("Nenhum link emitido até agora.")
+        return
+    hoje = date.today()
+
+    def situacao(link):
+        if not link.ativo:
+            return "Revogado"
+        return "Expirado" if link.expira_em < hoje else "Ativo"
+
+    st.dataframe(pd.DataFrame([{
+        "ID": l.id, "Aluno": l.aluno.nome if l.aluno else "-", "Criado em": formatar_data_hora(l.criado_em),
+        "Válido até": para_str_br(l.expira_em), "Situação": situacao(l), "Acessos": l.acessos or 0,
+        "Último acesso": formatar_data_hora(l.ultimo_acesso) if l.ultimo_acesso else "-",
+        "Criado por": l.criado_por or "-",
+    } for l in links]), width="stretch", hide_index=True)
+    ativos = [l for l in links if situacao(l) == "Ativo"]
+    if ativos:
+        opcoes = {f"#{l.id} — {l.aluno.nome if l.aluno else '-'} — até {para_str_br(l.expira_em)}": l.id for l in ativos}
+        escolha = st.selectbox("Revogar um link ativo", list(opcoes), key="revogar_link_sel")
+        if st.button("Revogar link selecionado", key="revogar_link_btn"):
+            link = db.get(LinkFamiliar, opcoes[escolha])
+            try:
+                link.ativo = 0
+                db.commit()
+            except SQLAlchemyError as exc:
+                db.rollback()
+                mensagem_erro(exc, "revogação do link")
+            else:
+                registrar_auditoria("link_familiar_revogado", f"link_id={link.id}", usuario.nome)
+                st.success("Link revogado. A família deixa de ter acesso imediatamente.")
+                st.rerun()
+
+
+def tela_desempenho(db, usuario):
+    st.title("Desempenho e acompanhamento")
+    st.caption("Análise qualitativa por aluno e links individuais para as famílias.")
+    link_atual = obter_link_planilha(db)
+    with st.expander("⚙️ Planilha mestre (Google Sheets)", expanded=not link_atual):
+        with st.form("f_mestre"):
+            st.write("Link da planilha mestre do Google Sheets. A aba esperada é OBSERVAÇÃO DO ATENDIMENTO.")
+            novo_link = st.text_input("Link da planilha", value=link_atual or "")
+            salvar = st.form_submit_button("Salvar configuração", type="primary")
+        if salvar:
+            if novo_link.strip() and "docs.google.com/spreadsheets" not in novo_link:
+                st.error("Informe um link válido do Google Sheets.")
+            else:
+                try:
+                    cfg = db.query(ConfiguracaoSistema).filter_by(chave="link_planilha_mestre").first()
+                    if cfg:
+                        cfg.valor = novo_link.strip()
+                    else:
+                        db.add(ConfiguracaoSistema(chave="link_planilha_mestre", valor=novo_link.strip()))
+                    db.commit()
+                except SQLAlchemyError as exc:
+                    db.rollback()
+                    mensagem_erro(exc, "configuração da planilha")
+                else:
+                    carregar_planilha_observacao_atendimento.clear()
+                    st.success("Configuração salva.")
+                    st.rerun()
+    alunos = db.query(Aluno).filter_by(ativo=1).order_by(Aluno.nome).all()
+    if not alunos:
+        st.info("Cadastre alunos antes de consultar indicadores.")
+        return
+    tab_analise, tab_links = st.tabs(["📊 Análise por aluno", "🔗 Links para as famílias"])
+    with tab_analise:
+        if link_atual:
+            _analise_interna(alunos, link_atual)
+        else:
+            st.info("Configure a planilha mestre para consultar os indicadores.")
+    with tab_links:
+        tela_links_familiares(db, usuario, alunos)
+
+
+def renderizar_portal_familiar(db, token, logo, cfg):
+    """Página pública acessada pelo link individual (?portal=TOKEN), sem login."""
+    aplicar_estilo_global()
+    st.markdown(
+        "<style>[data-testid='stSidebar'],[data-testid='stSidebarCollapsedControl'],"
+        "[data-testid='collapsedControl']{display:none !important;}</style>",
+        unsafe_allow_html=True)
+    cabecalho(logo, cfg)
+    link = validar_token_portal(db, token)
+    if not link:
+        st.error("Este link é inválido, expirou ou foi revogado.")
+        st.info(f"Solicite um novo link a {cfg['profissional_responsavel']}.")
+        return
+    aluno = link.aluno
+    chave_acesso = f"portal_acesso_registrado_{link.id}"
+    if not st.session_state.get(chave_acesso):
+        try:
+            link.acessos = (link.acessos or 0) + 1
+            link.ultimo_acesso = datetime.now()
+            db.commit()
+        except SQLAlchemyError:
+            db.rollback()
+        registrar_auditoria("portal_familiar_acesso", f"link_id={link.id}; aluno_id={aluno.id}", usuario="Família")
+        st.session_state[chave_acesso] = True
+
+    st.title(f"Acompanhamento de {aluno.nome}")
+    st.caption(f"Link pessoal válido até {para_str_br(link.expira_em)}. Por favor, não compartilhe.")
+
+    link_planilha = obter_link_planilha(db)
+    df = carregar_planilha_observacao_atendimento(link_planilha) if link_planilha else None
+    df_aluno, indicadores = (filtrar_e_analisar_aluno(df, aluno.nome)
+                             if df is not None and not df.empty else (pd.DataFrame(), []))
+    if df_aluno.empty:
+        st.info("Os registros de atendimento ainda não estão disponíveis. Volte em breve.")
+    else:
+        renderizar_analise_desempenho(df_aluno, indicadores, aluno.nome, "portal", publico=True)
+
+    st.subheader("📁 Atividades pedagógicas")
+    atividades = (db.query(AtividadeAluno)
+                  # No SQL, "status != 'Cancelada'" descarta status NULL; o or_ mantém esses registros.
+                  .filter(AtividadeAluno.aluno_id == aluno.id,
+                          or_(AtividadeAluno.status.is_(None), AtividadeAluno.status != "Cancelada"))
+                  .order_by(AtividadeAluno.data_atividade.desc(), AtividadeAluno.id.desc())
+                  .limit(50).all())
+    if atividades:
+        st.dataframe(pd.DataFrame([{
+            "Data": para_str_br(a.data_atividade), "Atividade": a.titulo,
+            "Área": a.area or a.categoria or "-", "Situação": normalizar_status_atividade(a.status),
+            "Objetivo": a.objetivo or "-",
+        } for a in atividades]), width="stretch", hide_index=True)
+    else:
+        st.info("Ainda não há atividades registradas.")
+    st.divider()
+    st.caption(f"{cfg['nome_instituicao']} · {cfg['profissional_responsavel']} · {cfg['titulo_profissional']}. "
+               "Em caso de dúvidas, fale diretamente com a profissional.")
 
 
 def tela_financeiro(db):
     st.title("Financeiro — lançamentos")
+    resumo = resumo_financeiro(db)
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("A receber (em dia)", moeda(resumo["a_receber"]))
+    k2.metric("Em atraso", moeda(resumo["em_atraso"]), f"{resumo['qtd_atraso']} lançamento(s)",
+              delta_color="inverse" if resumo["qtd_atraso"] else "off")
+    k3.metric("Recebido no mês", moeda(resumo["recebido_mes"]))
+    k4.metric("Despesas pagas no mês", moeda(resumo["despesas_mes"]))
     alunos = db.query(Aluno).order_by(Aluno.nome).all()
     mapa = {"Sem vínculo com aluno": None}
     mapa.update({f"{a.id} — {a.nome}{'' if a.ativo else ' (inativo)'}": a.id for a in alunos})
@@ -1186,6 +2229,9 @@ def tela_financeiro(db):
             valor = st.number_input("Valor (R$)", min_value=0.01, value=100.0, step=10.0)
             vencimento = st.date_input("Data de vencimento", value=date.today(), format="DD/MM/YYYY")
             aluno_label = st.selectbox("Aluno (opcional)", list(mapa))
+            c_pag1, c_pag2 = st.columns(2)
+            ja_pago = c_pag1.checkbox("Já foi pago", value=False)
+            data_pag = c_pag2.date_input("Data do pagamento (se já pago)", value=date.today(), format="DD/MM/YYYY")
             observacao = st.text_area("Observação")
             salvar = st.form_submit_button("Registrar lançamento", type="primary")
         if salvar:
@@ -1195,7 +2241,8 @@ def tela_financeiro(db):
                 try:
                     db.add(LancamentoFinanceiro(tipo=tipo, descricao=descricao.strip(), categoria=categoria,
                         valor=float(valor), data_vencimento=vencimento, aluno_id=mapa[aluno_label],
-                        observacao=observacao.strip(), status="Pendente"))
+                        observacao=observacao.strip(), status="Pago" if ja_pago else "Pendente",
+                        data_pagamento=data_pag if ja_pago else None))
                     db.commit()
                     st.success("Lançamento registrado.")
                     st.rerun()
@@ -1207,14 +2254,26 @@ def tela_financeiro(db):
         if not todos:
             st.info("Nenhum lançamento financeiro cadastrado.")
             return
-        filtro = st.selectbox("Filtrar situação", ["Todas"] + status_opcoes, key="financeiro_filtro_status")
-        filtrados = todos if filtro == "Todas" else [l for l in todos if l.status == filtro]
+        hoje = date.today()
+
+        def situacao_exibida(l):
+            if l.status == "Pendente" and l.data_vencimento and l.data_vencimento < hoje:
+                return "Em atraso"
+            return l.status
+
+        filtro = st.selectbox("Filtrar situação", ["Todas", "Em atraso"] + status_opcoes, key="financeiro_filtro_status")
+        if filtro == "Todas":
+            filtrados = todos
+        elif filtro == "Em atraso":
+            filtrados = [l for l in todos if situacao_exibida(l) == "Em atraso"]
+        else:
+            filtrados = [l for l in todos if l.status == filtro]
         st.dataframe(pd.DataFrame([{
             "ID": l.id, "Tipo": l.tipo, "Descrição": l.descricao, "Categoria": l.categoria,
             "Valor": moeda(l.valor), "Vencimento": para_str_br(l.data_vencimento),
-            "Pagamento": para_str_br(l.data_pagamento), "Situação": l.status,
+            "Pagamento": para_str_br(l.data_pagamento), "Situação": situacao_exibida(l),
             "Aluno": l.aluno.nome if l.aluno else "-"
-        } for l in filtrados]), use_container_width=True, hide_index=True)
+        } for l in filtrados]), width="stretch", hide_index=True)
         if filtrados:
             opcoes = {f"#{l.id} — {l.tipo} — {l.descricao} — {moeda(l.valor)} — {l.status}": l.id for l in filtrados}
             sel = st.selectbox("Selecione o lançamento para editar", list(opcoes), key="financeiro_editar_sel")
@@ -1253,6 +2312,18 @@ def tela_financeiro(db):
                     except SQLAlchemyError as exc:
                         db.rollback()
                         mensagem_erro(exc, "edição do lançamento financeiro")
+            if lanc.tipo == "Receita" and lanc.status == "Pago":
+                try:
+                    pdf_recibo = gerar_recibo_pdf(lanc, carregar_configuracoes(db), obter_logo())
+                except Exception as exc:
+                    mensagem_erro(exc, "geração do recibo")
+                else:
+                    st.download_button(
+                        "🧾 Baixar recibo (PDF)", data=pdf_recibo, file_name=f"recibo_{lanc.id:06d}.pdf",
+                        mime="application/pdf", key=f"recibo_{lanc.id}",
+                        on_click=registrar_auditoria, args=("recibo_emitido", f"lancamento_id={lanc.id}"))
+            elif lanc.tipo == "Receita":
+                st.caption("O recibo fica disponível quando a receita estiver com situação **Pago**.")
             st.caption("Não exclua lançamentos pagos para preservar a trilha financeira. Se necessário, marque como Cancelado e registre a justificativa na observação.")
         csv = pd.DataFrame([{
             "ID": l.id, "Tipo": l.tipo, "Descrição": l.descricao, "Categoria": l.categoria,
@@ -1299,7 +2370,7 @@ def tela_usuarios(db, perfil):
         mapa = {f"{u.id} — {u.nome} ({u.perfil})": u.id for u in usuarios}
         selecionado = st.selectbox("Usuário", list(mapa.keys()))
         usuario = db.get(Usuario, mapa[selecionado])
-        with st.form("f_editar_usuario"):
+        with st.form(f"f_editar_usuario_{usuario.id}"):
             nome = st.text_input("Nome", value=usuario.nome)
             perfil_novo = st.selectbox("Perfil", ["Admin", "Profissional", "Financeiro"],
                 index=["Admin", "Profissional", "Financeiro"].index(usuario.perfil if usuario.perfil in ["Admin","Profissional","Financeiro"] else "Admin"))
@@ -1307,112 +2378,201 @@ def tela_usuarios(db, perfil):
             nova_senha = st.text_input("Nova senha (deixe em branco para manter)", type="password")
             salvar = st.form_submit_button("Salvar usuário", type="primary")
         if salvar:
+            admins_ativos = db.query(func.count(Usuario.id)).filter(Usuario.perfil == "Admin", Usuario.ativo == 1).scalar() or 0
+            deixa_de_ser_admin = usuario.perfil == "Admin" and usuario.ativo and (perfil_novo != "Admin" or not ativo)
             if not nome.strip():
                 st.error("Informe o nome.")
             elif nova_senha and len(nova_senha) < 8:
                 st.error("A nova senha deve ter pelo menos 8 caracteres.")
+            elif deixa_de_ser_admin and admins_ativos <= 1:
+                st.error("Este é o único administrador ativo. Cadastre outro administrador antes de inativá-lo ou mudar o perfil.")
             else:
                 usuario.nome = nome.strip()
                 usuario.perfil = perfil_novo
                 usuario.ativo = 1 if ativo else 0
                 if nova_senha:
                     usuario.senha_hash = gerar_hash_senha(nova_senha)
-                db.commit()
+                try:
+                    db.commit()
+                except SQLAlchemyError as exc:
+                    db.rollback()
+                    mensagem_erro(exc, "edição do usuário")
+                    return
+                registrar_auditoria("usuario_alterado", f"usuario_id={usuario.id}; perfil={perfil_novo}; "
+                                    f"ativo={int(bool(ativo))}; senha_redefinida={bool(nova_senha)}")
                 if usuario.id == st.session_state.get("usuario_id") and not usuario.ativo:
                     st.session_state.clear()
                 st.success("Usuário atualizado.")
                 st.rerun()
 
 
+def tela_minha_senha(db, usuario, obrigatoria=False):
+    st.title("Alterar minha senha")
+    if obrigatoria:
+        st.warning("Por segurança, defina uma nova senha antes de continuar: a senha atual é a senha padrão ou tem menos de 8 caracteres.")
+    with st.form("f_minha_senha", clear_on_submit=True):
+        atual = st.text_input("Senha atual", type="password")
+        nova = st.text_input("Nova senha (mínimo 8 caracteres)", type="password")
+        confirma = st.text_input("Confirme a nova senha", type="password")
+        enviar = st.form_submit_button("Salvar nova senha", type="primary")
+    if not enviar:
+        return
+    if not verificar_senha(atual, usuario.senha_hash):
+        st.error("A senha atual não confere.")
+    elif len(nova) < 8:
+        st.error("A nova senha deve ter pelo menos 8 caracteres.")
+    elif nova != confirma:
+        st.error("A confirmação não confere com a nova senha.")
+    elif nova in (atual, SENHA_PADRAO_ADMIN):
+        st.error("Escolha uma senha diferente da atual e da senha padrão.")
+    else:
+        try:
+            usuario.senha_hash = gerar_hash_senha(nova)
+            db.commit()
+        except SQLAlchemyError as exc:
+            db.rollback()
+            mensagem_erro(exc, "alteração da senha")
+            return
+        st.session_state.pop("trocar_senha_obrigatoria", None)
+        registrar_auditoria("senha_alterada", usuario=usuario.nome)
+        st.success("Senha alterada.")
+        st.rerun()
+
+
 def tela_configuracoes(db):
     st.title("Configurações institucionais")
+    atual = carregar_configuracoes(db)
     with st.form("f_config_institucional"):
-        nome_instituicao = st.text_input("Nome da instituição", value="Espaço Dinâmico")
-        profissional = st.text_input("Profissional responsável", value="Larissa Lyrio")
-        titulo = st.text_input("Título profissional", value="Neuropsicopedagoga")
-        app_url = st.text_input("URL pública da aplicação (opcional)", value=os.getenv("APP_URL", ""))
+        nome_instituicao = st.text_input("Nome da instituição", value=atual["nome_instituicao"])
+        profissional = st.text_input("Profissional responsável", value=atual["profissional_responsavel"])
+        titulo = st.text_input("Título profissional", value=atual["titulo_profissional"])
+        app_url = st.text_input("URL pública da aplicação", value=atual["app_url"],
+                                placeholder="https://espacodinamico.streamlit.app",
+                                help="Usada para montar os links individuais das famílias.")
+        c_doc, c_cid = st.columns(2)
+        documento_prof = c_doc.text_input("CPF/CNPJ ou registro profissional (recibos)", value=atual["documento_profissional"],
+                                          placeholder="ex.: CNPJ 00.000.000/0001-00")
+        cidade = c_cid.text_input("Cidade/UF (recibos)", value=atual["cidade"], placeholder="ex.: Vitória/ES")
         salvar = st.form_submit_button("Salvar configurações", type="primary")
     if salvar:
-        valores = {
-            "nome_instituicao": nome_instituicao.strip(),
-            "profissional_responsavel": profissional.strip(),
-            "titulo_profissional": titulo.strip(),
-            "app_url": app_url.strip(),
-        }
-        for chave, valor in valores.items():
-            item = db.query(ConfiguracaoSistema).filter_by(chave=chave).first()
-            if item:
-                item.valor = valor
+        app_url_limpa = app_url.strip().rstrip("/")
+        if app_url_limpa and not (app_url_limpa.startswith("https://") or eh_endereco_local(app_url_limpa)):
+            st.error("A URL pública deve começar com https://")
+        else:
+            valores = {
+                "nome_instituicao": nome_instituicao.strip(),
+                "profissional_responsavel": profissional.strip(),
+                "titulo_profissional": titulo.strip(),
+                "app_url": app_url_limpa,
+                "documento_profissional": documento_prof.strip(),
+                "cidade": cidade.strip(),
+            }
+            try:
+                for chave, valor in valores.items():
+                    item = db.query(ConfiguracaoSistema).filter_by(chave=chave).first()
+                    if item:
+                        item.valor = valor
+                    else:
+                        db.add(ConfiguracaoSistema(chave=chave, valor=valor))
+                db.commit()
+            except SQLAlchemyError as exc:
+                db.rollback()
+                mensagem_erro(exc, "gravação das configurações")
             else:
-                db.add(ConfiguracaoSistema(chave=chave, valor=valor))
-        db.commit()
-        st.success("Configurações salvas no banco.")
-        st.rerun()
-    st.caption("As configurações são armazenadas no banco de dados. A URL pública não cria, por si só, um portal autenticado.")
+                registrar_auditoria("configuracoes_alteradas")
+                st.success("Configurações salvas no banco.")
+                st.rerun()
+    st.caption("Campos deixados em branco voltam ao valor padrão.")
+
+    with st.expander("🧾 Registro de auditoria (últimos 300 eventos)"):
+        logs = db.query(LogAuditoria).order_by(LogAuditoria.data_hora.desc()).limit(300).all()
+        if logs:
+            st.dataframe(pd.DataFrame([{
+                "Data/hora": formatar_data_hora(l.data_hora), "Usuário": l.usuario or "-",
+                "Ação": l.acao, "Detalhe": l.detalhe or "",
+            } for l in logs]), width="stretch", hide_index=True)
+        else:
+            st.info("Nenhum evento registrado ainda.")
 
 
 def main():
-    criar_usuario_admin_padrao()
+    try:
+        inicializar_banco()
+    except SQLAlchemyError as exc:
+        st.error("Não foi possível inicializar o banco de dados. Verifique a conexão com o PostgreSQL e os Secrets.")
+        print(f"[ERRO DATABASE] {exc}")
+        st.stop()
+
     logo = obter_logo()
     db = SessionLocal()
     try:
-        # Portal legado: não expor dados de aluno somente pelo nome na URL.
+        cfg = carregar_configuracoes(db)
+
+        # Portal da família: link individual com token aleatório, validade e revogação.
+        token_portal = st.query_params.get("portal")
+        if token_portal:
+            renderizar_portal_familiar(db, token_portal, logo, cfg)
+            return
+
+        # Portal legado por nome na URL continua desativado.
         if st.query_params.get("aluno"):
             aplicar_estilo_global()
             st.title("Portal familiar")
-            st.warning("O acesso por nome na URL foi desativado por segurança. Entre pelo sistema ou solicite a implementação de um link familiar individual protegido.")
+            st.warning("O acesso por nome na URL foi desativado por segurança. Solicite à profissional o seu link individual.")
             return
 
         usuario_id = st.session_state.get("usuario_id")
         usuario = db.get(Usuario, usuario_id) if usuario_id else None
         if not usuario or not usuario.ativo:
-            st.session_state.pop("usuario_id", None)
-            st.session_state.pop("usuario_logado", None)
-            st.session_state.pop("perfil_usuario", None)
-            renderizar_tela_login(db, logo)
+            encerrar_sessao()
+            renderizar_tela_login(db, logo, cfg)
             return
 
         st.session_state["usuario_logado"] = usuario.nome
         st.session_state["perfil_usuario"] = usuario.perfil
         aplicar_estilo_global()
+
+        if st.session_state.get("trocar_senha_obrigatoria"):
+            cabecalho(logo, cfg)
+            tela_minha_senha(db, usuario, obrigatoria=True)
+            if st.button("🚪 Sair", key="sair_troca_senha"):
+                encerrar_sessao()
+                st.rerun()
+            return
+
+        permitidas = PERMISSOES.get(usuario.perfil, set())
+        menu_opcoes = [p for p in MENU_PAGINAS if p in permitidas] + ["🔑 Minha senha"]
+
         with st.sidebar:
             if logo:
                 st.image(logo, width=145)
-            st.markdown("## Espaço Dinâmico")
-            st.caption("Larissa Lyrio · Neuropsicopedagoga")
+            st.markdown(f"## {cfg['nome_instituicao']}")
+            st.caption(f"{cfg['profissional_responsavel']} · {cfg['titulo_profissional']}")
             st.divider()
-            pagina = st.radio("MENU PRINCIPAL", [
-                "📊 Painel", "👥 Alunos e responsáveis", "📄 Contratos",
-                "📂 Prontuários", "📁 Atividades", "💰 Financeiro",
-                "📈 Desempenho", "👤 Usuários", "⚙️ Configurações",
-            ], label_visibility="visible")
+            pagina = st.radio("MENU PRINCIPAL", menu_opcoes, label_visibility="visible")
             st.divider()
             st.write(f"Conectado: **{usuario.nome}**")
             st.caption(f"Perfil: {usuario.perfil}")
-            if st.button("🚪 Sair", use_container_width=True, key="sair_sistema"):
-                for chave in ("usuario_id", "usuario_logado", "perfil_usuario"):
-                    st.session_state.pop(chave, None)
+            if st.button("🚪 Sair", width="stretch", key="sair_sistema"):
+                registrar_auditoria("logout", usuario=usuario.nome)
+                encerrar_sessao()
                 st.rerun()
 
-        cabecalho(logo)
-        if pagina == "📊 Painel":
-            tela_painel(db)
-        elif pagina == "👥 Alunos e responsáveis":
-            tela_cadastros(db)
-        elif pagina == "📄 Contratos":
-            tela_contratos(db)
-        elif pagina == "📂 Prontuários":
-            tela_prontuario(db)
-        elif pagina == "📁 Atividades":
-            tela_atividades(db)
-        elif pagina == "💰 Financeiro":
-            tela_financeiro(db)
-        elif pagina == "📈 Desempenho":
-            tela_desempenho(db)
-        elif pagina == "👤 Usuários":
-            tela_usuarios(db, usuario.perfil)
-        elif pagina == "⚙️ Configurações":
-            tela_configuracoes(db)
+        cabecalho(logo, cfg)
+        telas = {
+            "📊 Painel": lambda: tela_painel(db, usuario.perfil),
+            "👥 Alunos e responsáveis": lambda: tela_cadastros(db),
+            "📄 Contratos": lambda: tela_contratos(db),
+            "📂 Prontuários": lambda: tela_prontuario(db),
+            "📁 Atividades": lambda: tela_atividades(db),
+            "🗄️ Guarda documental": lambda: tela_guarda_documental(db, usuario),
+            "💰 Financeiro": lambda: tela_financeiro(db),
+            "📈 Desempenho": lambda: tela_desempenho(db, usuario),
+            "👤 Usuários": lambda: tela_usuarios(db, usuario.perfil),
+            "⚙️ Configurações": lambda: tela_configuracoes(db),
+            "🔑 Minha senha": lambda: tela_minha_senha(db, usuario),
+        }
+        telas[pagina]()
     except SQLAlchemyError as exc:
         db.rollback()
         mensagem_erro(exc, "acesso ao banco de dados")
