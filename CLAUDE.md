@@ -57,6 +57,9 @@ Menu e acesso definidos em `MENU_PAGINAS` e `PERMISSOES`:
 - Colunas aditivas (`MIGRACOES_ADITIVAS`): `visivel_familia` (padrão 0: documentos antigos ficam privados), `mensagem_familia` (texto para os pais; `descricao` é anotação interna), `compartilhado_em`, `visualizacoes_familia`.
 - Portal (`renderizar_caderno_portal`): mostra só registros do aluno do link, ativos e com `visivel_familia = 1`. O link do PDF é gerado só no clique e soma uma visualização. `CATEGORIAS_SENSIVEIS` (laudo, contrato, autorização, comprovante) só são compartilhadas com confirmação explícita.
 
+- Visualização do PDF **dentro do sistema** (`visualizar_pdf_inline`: páginas como imagens + download), no Caderno ("👁️ Ver o PDF aqui") e no portal ("📄 Ver a atividade"). Não depende de link externo do Supabase, que celulares e o navegador do WhatsApp bloqueiam. Conta uma visualização da família por sessão.
+- No Caderno, a seção de compartilhamento avisa quando o registro está 🔒 privado e mostra a situação do link da família (`bloco_link_familia`), com botão para gerar o link (180 dias) e enviar pelo WhatsApp sem sair da tela.
+
 ## ✍️ Atividade com caneta (folhas interativas, modo atendimento)
 
 - Fluxo: atividade pronta (Canva/Word/Excel exportada em PDF) importada em 📎 Materiais em PDF → "Começar a preencher" → o aluno escreve com mesa digitalizadora/caneta/dedo → "Concluir" gera um PDF (fundo + tinta) que vai para o Caderno Digital, privado por padrão.

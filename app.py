@@ -2702,17 +2702,15 @@ def tela_caderno_digital(db, usuario):
         selecionado = st.selectbox("Registro", list(opcoes), key="doc_selecionado")
         doc = db.get(DocumentoAluno, opcoes[selecionado])
         c1, c2 = st.columns(2)
+        chave_ver = f"ver_doc_{doc.id}"
         with c1:
-            # O link só é gerado quando solicitado (antes era gerado a cada clique na tela).
-            chave_link = f"link_doc_{doc.id}"
-            if st.button("Gerar link temporário (10 min)", key=f"btn_{chave_link}", width="stretch"):
-                try:
-                    st.session_state[chave_link] = gerar_link_pdf(doc.caminho_storage)
+            ver = bool(st.session_state.get(chave_ver))
+            if st.button("🔼 Fechar visualização" if ver else "👁️ Ver o PDF aqui", key=f"btn_{chave_ver}",
+                         width="stretch", type="primary"):
+                st.session_state[chave_ver] = not ver
+                if not ver:
                     registrar_auditoria("documento_aberto", f"documento_id={doc.id}", usuario.nome)
-                except Exception as exc:
-                    mensagem_erro(exc, "geração do acesso ao PDF")
-            if st.session_state.get(chave_link):
-                st.link_button("📄 Abrir PDF", st.session_state[chave_link], width="stretch")
+                st.rerun()
         with c2:
             if doc.status == "Ativo":
                 confirmar = st.checkbox("Confirmo o arquivamento deste registro", key=f"confirmar_arq_doc_{doc.id}")
@@ -2728,7 +2726,16 @@ def tela_caderno_digital(db, usuario):
                         registrar_auditoria("caderno_registro_arquivado", f"documento_id={doc.id}", usuario.nome)
                         st.rerun()
 
+        if st.session_state.get(chave_ver):
+            with st.container(border=True):
+                visualizar_pdf_inline(doc.caminho_storage, doc.sha256, doc.nome_original, f"caderno_doc_{doc.id}")
+
         st.markdown("##### 👪 Compartilhamento com a família")
+        if doc.status == "Ativo" and not doc.visivel_familia:
+            st.warning("🔒 **A família ainda NÃO vê este registro.** Marque *Mostrar este registro no portal da "
+                       "família* e clique em **Salvar compartilhamento**.")
+        if doc.status == "Ativo" and doc.aluno:
+            bloco_link_familia(db, usuario, doc.aluno, "caderno")
         if doc.status != "Ativo":
             st.info("Registros arquivados não aparecem no portal.")
         else:
@@ -3044,6 +3051,91 @@ def tela_desempenho(db, usuario):
         tela_links_familiares(db, usuario, alunos)
 
 
+MAX_PAGINAS_VISUALIZACAO = 15
+
+
+def visualizar_pdf_inline(caminho, sha256, nome_arquivo, prefixo):
+    """Mostra as páginas do PDF como imagens DENTRO do sistema e oferece o download.
+
+    Não depende de link externo nem de nova aba (que celulares e o navegador do WhatsApp
+    costumam bloquear). O arquivo é lido do Storage privado só no servidor.
+    """
+    try:
+        with st.spinner("Abrindo o arquivo…"):
+            conteudo = pdf_do_material(caminho, sha256)
+            total = contar_paginas_pdf(conteudo)
+    except Exception as exc:
+        print(f"[ERRO] visualização do PDF {caminho}: {exc}")
+        st.warning("Não foi possível abrir o arquivo agora. Tente novamente em instantes.")
+        return False
+    st.download_button("⬇️ Baixar o PDF", data=conteudo, file_name=nome_arquivo or "documento.pdf",
+                       mime="application/pdf", key=f"{prefixo}_baixar", width="stretch")
+    for n in range(1, min(total, MAX_PAGINAS_VISUALIZACAO) + 1):
+        try:
+            jpeg, _, _ = imagem_pagina(caminho, sha256, n)
+        except Exception as exc:
+            print(f"[ERRO] página {n} de {caminho}: {exc}")
+            st.warning(f"Não foi possível mostrar a página {n}. Use o botão de download.")
+            break
+        st.image(jpeg, caption=f"Página {n} de {total}" if total > 1 else None, width="stretch")
+    if total > MAX_PAGINAS_VISUALIZACAO:
+        st.caption(f"Mostrando {MAX_PAGINAS_VISUALIZACAO} de {total} páginas. Baixe o PDF para ver todas.")
+    return True
+
+
+def links_ativos_do_aluno(db, aluno_id):
+    hoje = date.today()
+    return (db.query(LinkFamiliar).filter(LinkFamiliar.aluno_id == aluno_id, LinkFamiliar.ativo == 1,
+                                          LinkFamiliar.expira_em >= hoje)
+            .order_by(LinkFamiliar.criado_em.desc()).all())
+
+
+def bloco_link_familia(db, usuario, aluno, prefixo):
+    """Situação do acesso da família ao portal + gerar/enviar link sem sair da tela."""
+    cfg = carregar_configuracoes(db)
+    app_url = cfg.get("app_url", "") or detectar_url_base()
+    ativos = links_ativos_do_aluno(db, aluno.id)
+    if ativos:
+        l = ativos[0]
+        st.success(f"🔗 A família de {aluno.nome} tem link ativo até {para_str_br(l.expira_em)} "
+                   f"(aberto {l.acessos or 0} vez(es)). O registro aparece lá assim que for compartilhado.")
+        rotulo = "Gerar um novo link (a família perdeu o anterior)"
+    else:
+        st.warning(f"⚠️ A família de {aluno.nome} ainda **não tem link** para o portal: sem ele, ela não vê nada.")
+        rotulo = "🔗 Gerar link da família (180 dias)"
+    chave = f"{prefixo}_link_gerado_{aluno.id}"
+    if st.button(rotulo, key=f"{prefixo}_gerar_link_{aluno.id}", type="secondary" if ativos else "primary"):
+        try:
+            token = gerar_link_familiar(db, aluno.id, 180, usuario.nome, revogar_anteriores=True)
+        except SQLAlchemyError as exc:
+            db.rollback()
+            mensagem_erro(exc, "geração do link")
+        else:
+            registrar_auditoria("link_familiar_gerado", f"aluno_id={aluno.id}; validade=180 dias; origem=caderno",
+                                usuario.nome)
+            st.session_state[chave] = {"url": montar_url_portal(app_url, token),
+                                       "validade": para_str_br(date.today() + timedelta(days=180))}
+            st.rerun()
+    gerado = st.session_state.get(chave)
+    if gerado:
+        st.code(gerado["url"], language=None)
+        st.caption("Copie agora (ícone no canto): por segurança o sistema não consegue mostrar este link de novo.")
+        b1, b2 = st.columns(2)
+        if gerado["url"].startswith("http"):
+            b1.link_button("👁️ Abrir o portal (testar)", gerado["url"], width="stretch")
+        telefone = aluno.responsavel.telefone if aluno.responsavel else ""
+        texto = (f"Olá! Segue o link para acompanhar o caderno e o desenvolvimento de {aluno.nome} no "
+                 f"{cfg['nome_instituicao']}: {gerado['url']} (válido até {gerado['validade']}). "
+                 "Este link é pessoal, por favor não compartilhe.")
+        wa = link_whatsapp(telefone, texto) if not eh_endereco_local(gerado["url"]) else None
+        if wa:
+            b2.link_button("📲 Enviar pelo WhatsApp", wa, width="stretch")
+        elif eh_endereco_local(gerado["url"]):
+            b2.caption("Link de teste (endereço local): só abre neste computador.")
+        else:
+            b2.caption("Cadastre o telefone do responsável para enviar pelo WhatsApp.")
+
+
 def renderizar_caderno_portal(db, link, aluno):
     """Caderno Digital no portal: SOMENTE registros ativos marcados como visíveis à família."""
     st.subheader("📓 Caderno Digital")
@@ -3066,22 +3158,25 @@ def renderizar_caderno_portal(db, link, aluno):
             st.caption(f"{para_str_br(reg.criado_em)} · {reg.categoria}")
             if reg.mensagem_familia:
                 st.markdown(html.escape(reg.mensagem_familia).replace("\n", "  \n"))
-            chave = f"portal_link_doc_{reg.id}"
-            if storage_ok and st.button("📄 Abrir PDF", key=f"btn_{chave}"):
-                try:
-                    st.session_state[chave] = gerar_link_pdf(reg.caminho_storage)
-                    reg.visualizacoes_familia = (reg.visualizacoes_familia or 0) + 1
-                    db.commit()
-                except SQLAlchemyError:
-                    db.rollback()
-                except Exception as exc:
-                    print(f"[ERRO] portal: link do documento {reg.id}: {exc}")
-                    st.warning("Não foi possível abrir o arquivo agora. Tente novamente em instantes.")
-                else:
+            if not storage_ok:
+                continue
+            chave = f"portal_ver_doc_{reg.id}"
+            aberto = bool(st.session_state.get(chave))
+            if st.button("🔼 Fechar" if aberto else "📄 Ver a atividade", key=f"btn_{chave}"):
+                st.session_state[chave] = not aberto
+                if not aberto and not st.session_state.get(f"{chave}_contado"):
+                    # Conta uma visualização por sessão (não a cada clique).
+                    try:
+                        reg.visualizacoes_familia = (reg.visualizacoes_familia or 0) + 1
+                        db.commit()
+                    except SQLAlchemyError:
+                        db.rollback()
                     registrar_auditoria("portal_caderno_aberto", f"link_id={link.id}; documento_id={reg.id}",
                                         usuario="Família")
-            if st.session_state.get(chave):
-                st.link_button("Abrir o arquivo (link válido por 10 minutos)", st.session_state[chave])
+                    st.session_state[f"{chave}_contado"] = True
+                st.rerun()
+            if aberto:
+                visualizar_pdf_inline(reg.caminho_storage, reg.sha256, reg.nome_original, f"portal_doc_{reg.id}")
 
 
 def renderizar_portal_familiar(db, token, logo, cfg):
@@ -3109,7 +3204,7 @@ def renderizar_portal_familiar(db, token, logo, cfg):
         registrar_auditoria("portal_familiar_acesso", f"link_id={link.id}; aluno_id={aluno.id}", usuario="Família")
         st.session_state[chave_acesso] = True
 
-    st.title(f"Acompanhamento de {aluno.nome}")
+    st.header(f"Acompanhamento de {aluno.nome}")  # header: título menor, sem quebrar palavra no celular
     st.caption(f"Link pessoal válido até {para_str_br(link.expira_em)}. Por favor, não compartilhe.")
 
     renderizar_caderno_portal(db, link, aluno)
