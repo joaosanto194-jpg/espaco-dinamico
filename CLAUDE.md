@@ -29,6 +29,7 @@ Menu e acesso definidos em `MENU_PAGINAS` e `PERMISSOES`:
 
 - Migrações somente aditivas (`aplicar_migracoes_aditivas`): nunca apagar/reescrever dados existentes. Tabelas novas via `Base.metadata.create_all`.
 - Engine e inicialização do banco ficam em `@st.cache_resource` (`criar_engine`, `inicializar_banco`), não rodar a cada rerun.
+- `inicializar_banco(versao_esquema())`: a assinatura do esquema é o argumento do cache. O Streamlit Cloud atualiza o código sem reiniciar o processo, então, sem isso, colunas novas não eram criadas (erro "acesso ao banco de dados"). No `main`, `erro_de_esquema` refaz a migração uma vez como rede de segurança.
 - Toda gravação em `try/except SQLAlchemyError` com `db.rollback()` e `mensagem_erro(...)`; não exibir detalhes técnicos na tela.
 - Ações relevantes registradas com `registrar_auditoria(acao, detalhe)` (tabela `log_auditoria`).
 - Senhas: PBKDF2-SHA256 com sal (`gerar_hash_senha` / `verificar_senha`); hashes SHA-256 legados são convertidos no login. Senha padrão `admin123` ou < 8 caracteres força troca.

@@ -474,9 +474,32 @@ def aplicar_migracoes_aditivas():
                     conexao.execute(sql_text(f'ALTER TABLE {tabela} ADD COLUMN "{nome}" {tipo_sql}'))
 
 
+def versao_esquema():
+    """Assinatura do esquema esperado (tabelas + colunas do modelo + migrações aditivas).
+
+    Vai como argumento de inicializar_banco: o cache_resource é por argumento, então qualquer
+    mudança de esquema faz as migrações rodarem de novo. Sem isso, o Streamlit Cloud atualiza o
+    código SEM reiniciar o processo e o cache antigo pulava as migrações (colunas novas ausentes).
+    """
+    partes = [json.dumps(MIGRACOES_ADITIVAS, sort_keys=True)]
+    for nome, tabela in sorted(Base.metadata.tables.items()):
+        partes.append(nome + ":" + ",".join(sorted(c.name for c in tabela.columns)))
+    return hashlib.sha256("|".join(partes).encode("utf-8")).hexdigest()[:16]
+
+
+def erro_de_esquema(exc):
+    """Coluna/tabela inexistente (PostgreSQL ou SQLite): sinal de migração não aplicada."""
+    texto = str(exc).casefold()
+    return any(t in texto for t in ("undefinedcolumn", "undefinedtable", "does not exist",
+                                    "no such column", "no such table"))
+
+
 @st.cache_resource(show_spinner="Preparando o banco de dados...")
-def inicializar_banco():
-    """Backup diário (SQLite), criação de tabelas novas e migrações aditivas."""
+def inicializar_banco(versao=None):
+    """Backup diário (SQLite), criação de tabelas novas e migrações aditivas.
+
+    versao: assinatura de versao_esquema(); só serve para invalidar o cache quando o esquema muda.
+    """
     try:
         backup_sqlite_automatico()
     except Exception as exc:
@@ -4351,7 +4374,7 @@ def tela_configuracoes(db):
 
 def main():
     try:
-        inicializar_banco()
+        inicializar_banco(versao_esquema())
     except SQLAlchemyError as exc:
         st.error("Não foi possível inicializar o banco de dados. Verifique a conexão com o PostgreSQL e os Secrets.")
         print(f"[ERRO DATABASE] {exc}")
@@ -4433,6 +4456,17 @@ def main():
         telas[pagina]()
     except SQLAlchemyError as exc:
         db.rollback()
+        # Rede de segurança: coluna/tabela ausente = migração não aplicada. Refaz UMA vez e recarrega.
+        if erro_de_esquema(exc) and not st.session_state.get("_migracao_refeita"):
+            print(f"[AVISO] Esquema desatualizado, refazendo migrações: {str(exc)[:300]}")
+            st.session_state["_migracao_refeita"] = True
+            inicializar_banco.clear()
+            try:
+                inicializar_banco(versao_esquema())
+            except SQLAlchemyError as exc2:
+                print(f"[ERRO DATABASE] migração falhou: {exc2}")
+            else:
+                st.rerun()
         mensagem_erro(exc, "acesso ao banco de dados")
     finally:
         db.close()
