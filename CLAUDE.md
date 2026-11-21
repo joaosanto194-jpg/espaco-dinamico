@@ -109,6 +109,12 @@ Menu e acesso definidos em `MENU_PAGINAS` e `PERMISSOES`:
 - A escolha é feita ao gerar o link (📈 Desempenho → 🔗 Links) e pode ser mudada depois em "Mudar o que a família vê", sem gerar novo link. O bloco do Caderno avisa quando o link não mostra o Caderno.
 - O portal mostra só as seções liberadas, em abas quando há mais de uma.
 
+## Exclusão definitiva (21/11/2026)
+
+- Perfis Admin e Profissional (`pode_excluir`). Painel "🗑️ Excluir definitivamente" com confirmação (`confirmar_exclusao`) em: Caderno (registro + PDF), Materiais em PDF (material + folhas com caneta derivadas + PDF), Atividades pedagógicas e Atividade com caneta (folha + escrita).
+- Funções `excluir_documento`, `excluir_material`, `excluir_folha` e `excluir_atividade`: apagam no banco primeiro (desfazem vínculos: `documento_id` e `atividade_id` viram NULL) e depois o arquivo no Storage, sem bloquear se o Storage falhar. Tudo vai para a auditoria (`*_excluido/a`).
+- Testado com chaves estrangeiras verificadas (como no PostgreSQL). Arquivar/cancelar continuam existindo como opção sem perda.
+
 ## Situação (21/11/2026)
 
 **Homologado pela usuária e em uso no Streamlit Cloud** (app publicado com PostgreSQL/Supabase e Storage configurados). Novos ajustes só quando ela acionar. Antes de cada publicação: backup CSV do Supabase em `backups_banco/`, testes locais (SQLite + Storage simulado) e conferência no PostgreSQL, que é mais rígido que o SQLite (ex.: GROUP BY).

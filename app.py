@@ -2418,6 +2418,89 @@ def tela_materiais_pdf(db, usuario, alunos, categorias):
                         st.rerun()
             st.caption(f"Arquivo original: {mat.nome_original} · SHA-256 {mat.sha256[:16]}…")
 
+        if pode_excluir(usuario):
+            usos = db.query(func.count(FolhaInterativa.id)).filter(FolhaInterativa.material_id == mat.id).scalar() or 0
+            aviso = (f"Também serão apagadas {usos} folha(s) com caneta feitas a partir dele "
+                     "(os PDFs já guardados no Caderno Digital continuam lá)." if usos else "")
+            if confirmar_exclusao(f"excl_mat_{mat.id}", f"o material “{mat.titulo}” e o arquivo PDF", aviso):
+                try:
+                    excluir_material(db, mat, usuario.nome)
+                except SQLAlchemyError as exc:
+                    db.rollback()
+                    mensagem_erro(exc, "exclusão do material")
+                else:
+                    st.session_state.pop("mat_sel", None)
+                    st.rerun()
+
+
+# --------------------------- EXCLUSÃO DEFINITIVA -------------
+def pode_excluir(usuario):
+    return getattr(usuario, "perfil", "") in ("Admin", "Profissional")
+
+
+def confirmar_exclusao(chave, descricao, detalhe=""):
+    """Painel com aviso + confirmação explícita. Retorna True só no clique confirmado."""
+    with st.expander("🗑️ Excluir definitivamente"):
+        st.warning(f"Isto apaga **{descricao}** de forma permanente. Não é possível desfazer."
+                   + (f" {detalhe}" if detalhe else "")
+                   + " Se quiser apenas tirar de circulação, prefira arquivar/cancelar.")
+        ok = st.checkbox("Entendo que a exclusão é permanente", key=f"{chave}_ok")
+        return st.button("Excluir definitivamente", key=f"{chave}_btn", type="primary", disabled=not ok)
+
+
+def _apagar_arquivo_storage(caminho):
+    """Depois do commit no banco: se o Storage falhar, sobra só um arquivo órfão (inofensivo)."""
+    try:
+        excluir_objeto_storage(caminho)
+    except Exception as exc:
+        print(f"[AVISO] Arquivo não removido do Storage ({caminho}): {exc}")
+
+
+def excluir_folha(db, folha, usuario_nome, commit=True):
+    """Apaga a folha com caneta e a escrita de cada página. O PDF já guardado no Caderno é mantido."""
+    db.query(FolhaPagina).filter_by(folha_id=folha.id).delete(synchronize_session=False)
+    detalhe = f"folha_id={folha.id}; titulo={folha.titulo}; aluno_id={folha.aluno_id}; status={folha.status}"
+    db.delete(folha)
+    if commit:
+        db.commit()
+        registrar_auditoria("folha_excluida", detalhe, usuario_nome)
+    return detalhe
+
+
+def excluir_documento(db, doc, usuario_nome):
+    """Apaga o registro do Caderno Digital e o PDF no Storage."""
+    caminho = doc.caminho_storage
+    detalhe = f"documento_id={doc.id}; titulo={doc.titulo}; aluno_id={doc.aluno_id}; categoria={doc.categoria}"
+    db.query(FolhaInterativa).filter_by(documento_id=doc.id).update({"documento_id": None},
+                                                                   synchronize_session=False)
+    db.delete(doc)
+    db.commit()
+    registrar_auditoria("caderno_registro_excluido", detalhe, usuario_nome)
+    _apagar_arquivo_storage(caminho)
+
+
+def excluir_material(db, mat, usuario_nome):
+    """Apaga o material em PDF, as folhas com caneta feitas a partir dele e o arquivo no Storage."""
+    caminho = mat.caminho_storage
+    folhas = db.query(FolhaInterativa).filter_by(material_id=mat.id).all()
+    for f in folhas:
+        excluir_folha(db, f, usuario_nome, commit=False)
+    detalhe = f"material_id={mat.id}; titulo={mat.titulo}; folhas_excluidas={len(folhas)}"
+    db.delete(mat)
+    db.commit()
+    registrar_auditoria("material_excluido", detalhe, usuario_nome)
+    _apagar_arquivo_storage(caminho)
+
+
+def excluir_atividade(db, atividade, usuario_nome):
+    """Apaga a atividade pedagógica; materiais vinculados ficam, só perdem o vínculo."""
+    db.query(MaterialPedagogico).filter_by(atividade_id=atividade.id).update({"atividade_id": None},
+                                                                             synchronize_session=False)
+    detalhe = f"atividade_id={atividade.id}; titulo={atividade.titulo}; aluno_id={atividade.aluno_id}"
+    db.delete(atividade)
+    db.commit()
+    registrar_auditoria("atividade_excluida", detalhe, usuario_nome)
+
 
 def iniciar_folha(db, material, aluno_id, usuario_nome):
     total = contar_paginas_pdf(pdf_do_material(material.caminho_storage, material.sha256))
@@ -2561,6 +2644,24 @@ def tela_atividade_caneta(db, usuario):
                 "No caderno": f"#{f.documento_id}" if f.documento_id else "-",
             } for f in concluidas]), width="stretch", hide_index=True)
             st.caption("O PDF preenchido está no 📓 Caderno Digital, onde você decide se a família vê.")
+
+    todas = (db.query(FolhaInterativa).filter_by(aluno_id=aluno_id)
+             .order_by(FolhaInterativa.criado_em.desc()).all())
+    if todas and pode_excluir(usuario):
+        op_folhas = {f"#{f.id} — {f.titulo} ({f.status}, {formatar_data_hora(f.criado_em)})": f.id for f in todas}
+        st.markdown("##### 🗑️ Excluir folha com caneta")
+        escolha_f = st.selectbox("Folha", list(op_folhas), key="excl_folha_sel")
+        folha_ex = db.get(FolhaInterativa, op_folhas[escolha_f])
+        if confirmar_exclusao(f"excl_folha_{folha_ex.id}", f"a folha “{folha_ex.titulo}” e a escrita do aluno",
+                              "Se ela já foi concluída, o PDF no Caderno Digital continua lá (exclua por lá, se quiser)."):
+            try:
+                excluir_folha(db, folha_ex, usuario.nome)
+            except SQLAlchemyError as exc:
+                db.rollback()
+                mensagem_erro(exc, "exclusão da folha")
+            else:
+                st.session_state.pop("excl_folha_sel", None)
+                st.rerun()
 
 
 def _tela_folha_aberta(db, usuario, folha):
@@ -2788,6 +2889,20 @@ def tela_atividades(db, usuario):
                         f"#{m.id} {html.escape(m.titulo)} ({m.tipo})" for m in anexos))
                     st.caption("Para abrir, use a aba 📎 Materiais em PDF → Biblioteca.")
                 st.caption("O histórico não é apagado: utilize Cancelada para atividades que não serão executadas.")
+                if pode_excluir(usuario):
+                    vinculos = (db.query(func.count(MaterialPedagogico.id))
+                                .filter(MaterialPedagogico.atividade_id == atividade.id).scalar() or 0)
+                    if confirmar_exclusao(f"excl_ativ_{atividade.id}", f"a atividade “{atividade.titulo}”",
+                                          f"{vinculos} PDF(s) ligado(s) a ela continuam na biblioteca, só sem o vínculo."
+                                          if vinculos else ""):
+                        try:
+                            excluir_atividade(db, atividade, usuario.nome)
+                        except SQLAlchemyError as exc:
+                            db.rollback()
+                            mensagem_erro(exc, "exclusão da atividade")
+                        else:
+                            st.session_state.pop("atividade_editar_sel_v2", None)
+                            st.rerun()
     with tab3:
         todos = db.query(AtividadeAluno).all()
         if todos:
@@ -3000,6 +3115,17 @@ def tela_caderno_digital(db, usuario):
                     else:
                         registrar_auditoria("caderno_registro_arquivado", f"documento_id={doc.id}", usuario.nome)
                         st.rerun()
+        if pode_excluir(usuario):
+            familia = " A família também deixa de ver este registro no portal." if doc.visivel_familia else ""
+            if confirmar_exclusao(f"excl_doc_{doc.id}", f"o registro “{doc.titulo}” e o arquivo PDF", familia.strip()):
+                try:
+                    excluir_documento(db, doc, usuario.nome)
+                except SQLAlchemyError as exc:
+                    db.rollback()
+                    mensagem_erro(exc, "exclusão do registro")
+                else:
+                    st.session_state.pop("doc_selecionado", None)
+                    st.rerun()
 
         if st.session_state.get(chave_ver):
             with st.container(border=True):
