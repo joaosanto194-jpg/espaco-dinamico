@@ -117,7 +117,7 @@ Menu e acesso definidos em `MENU_PAGINAS` e `PERMISSOES`:
 
 ## Situação (21/11/2026)
 
-**Homologado pela usuária e em uso no Streamlit Cloud** (app publicado com PostgreSQL/Supabase e Storage configurados). Novos ajustes só quando ela acionar. Antes de cada publicação: backup CSV do Supabase em `backups_banco/`, testes locais (SQLite + Storage simulado) e conferência no PostgreSQL, que é mais rígido que o SQLite (ex.: GROUP BY).
+**Homologação DEFINITIVA pela usuária em 21/11/2026 (versão `b96237b`); em uso no Streamlit Cloud** (app publicado com PostgreSQL/Supabase e Storage configurados). Novos ajustes só quando ela acionar. Antes de cada publicação: backup CSV do Supabase em `backups_banco/`, testes locais (SQLite + Storage simulado) e conferência no PostgreSQL, que é mais rígido que o SQLite (ex.: GROUP BY).
 
 ## Pendências / próximos passos
 
