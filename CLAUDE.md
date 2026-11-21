@@ -102,11 +102,17 @@ Menu e acesso definidos em `MENU_PAGINAS` e `PERMISSOES`:
 - O Painel tem o filtro de situação e mostra a métrica de inativos. Prontuários e Desempenho (análise) têm a opção "Incluir alunos inativos". As telas de criação (novo contrato, nova atividade, atividade com caneta, links da família) continuam só com alunos ativos.
 - Funções auxiliares: `SITUACOES_ALUNO`, `filtrar_por_situacao`, `rotulo_aluno` (sufixo "(inativo)").
 
+## Situação (21/11/2026)
+
+**Homologado pela usuária e em uso no Streamlit Cloud** (app publicado com PostgreSQL/Supabase e Storage configurados). Novos ajustes só quando ela acionar. Antes de cada publicação: backup CSV do Supabase em `backups_banco/`, testes locais (SQLite + Storage simulado) e conferência no PostgreSQL, que é mais rígido que o SQLite (ex.: GROUP BY).
+
 ## Pendências / próximos passos
 
-1. Testar o portal da família localmente (gerar link → "Abrir o portal (testar)").
-2. Publicar no Streamlit Cloud (app público) para a família abrir pelo celular; antes, migrar dados do SQLite local para o Supabase (no Cloud o SQLite se perde a cada reinício). Cadastrar a URL pública em Configurações.
-3. Guarda documental: falta configurar `[supabase]` (url, service_role_key, bucket) nos secrets e criar o bucket privado `documentos-clinicos`.
-4. Planilha Google aberta "a qualquer pessoa com o link" é risco LGPD → ler com conta de serviço (gspread) e fechar a planilha.
-5. Valores em dinheiro estão em `Float` → avaliar `Numeric(10,2)` com migração e backup.
-6. Ideias: relatórios, agenda de atendimentos, recibos.
+1. Segurança: a senha do banco foi exposta numa conversa. Trocar no Supabase e atualizar os Secrets do Cloud.
+2. Cadastrar a URL pública do app em ⚙️ Configurações (hoje vazia: o link da família usa o endereço detectado pelo navegador).
+3. Fuso horário: o Cloud roda em UTC (3 h à frente de Brasília). Horários da auditoria, dos links e dos recibos, e o "hoje" depois das 21h, podem sair errados. Usar `America/Sao_Paulo`.
+4. Planilha Google aberta "a qualquer pessoa com o link" é risco LGPD: ler com conta de serviço (gspread) e fechar a planilha.
+5. Valores em dinheiro estão em `Float`: avaliar `Numeric(10,2)` com migração e backup.
+6. Lançamentos antigos sem `servico` aparecem como "Não informado" no relatório anual (editar no Financeiro).
+7. Limpeza: cópias antigas fora do git (`app - Copia*.py`, `teste/`, `streamlit`, scripts avulsos).
+8. Ideias: tarefas de casa pelo portal da família com o componente de caneta; agenda de atendimentos.
