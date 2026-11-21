@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 from sqlalchemy import (
@@ -875,6 +876,44 @@ def gerar_recibo_pdf(lanc, cfg, logo=None):
     return buffer.getvalue()
 
 
+def dre_do_mes(db, ano, mes):
+    """Mini DRE pelo regime de caixa: o que foi efetivamente PAGO dentro do mês, por categoria."""
+    inicio = date(ano, mes, 1)
+    fim = date(ano, mes, calendar.monthrange(ano, mes)[1])
+    L = LancamentoFinanceiro
+    linhas = (db.query(L.tipo, func.coalesce(L.categoria, "Geral"), func.coalesce(func.sum(L.valor), 0))
+              .filter(L.status == "Pago", L.data_pagamento.between(inicio, fim))
+              .group_by(L.tipo, func.coalesce(L.categoria, "Geral")).all())
+    receitas = sorted(((c, float(v)) for t, c, v in linhas if t == "Receita"), key=lambda x: -x[1])
+    despesas = sorted(((c, float(v)) for t, c, v in linhas if t == "Despesa"), key=lambda x: -x[1])
+    total_r = sum(v for _, v in receitas)
+    total_d = sum(v for _, v in despesas)
+    return {"receitas": receitas, "despesas": despesas, "receita": total_r, "despesa": total_d,
+            "resultado": total_r - total_d, "margem": ((total_r - total_d) / total_r * 100) if total_r else None}
+
+
+def html_mini_dre(dre, titulo):
+    """Cartão do mini DRE (Receita, (−) Despesa, (=) Resultado) com o detalhe por categoria."""
+    esc = html.escape
+
+    def detalhe(itens):
+        return "".join(f'<tr class="det"><td>{esc(c)}</td><td>{esc(moeda(v))}</td></tr>' for c, v in itens)
+
+    resultado = dre["resultado"]
+    classe = "pos" if resultado > 0 else "neg" if resultado < 0 else ""
+    margem = (f'<div class="ed-dre-margem">Margem do mês: <b>{dre["margem"]:.1f}%</b></div>'.replace(".", ",")
+              if dre["margem"] is not None else "")
+    return f'''<div class="ed-dre">
+      <div class="ed-dre-titulo">{esc(titulo)}</div>
+      <table>
+        <tr class="grupo"><td>RECEITA</td><td>{esc(moeda(dre["receita"]))}</td></tr>{detalhe(dre["receitas"])}
+        <tr class="grupo menos"><td>(−) DESPESA</td><td>{esc(moeda(dre["despesa"]))}</td></tr>{detalhe(dre["despesas"])}
+        <tr class="total {classe}"><td>(=) RESULTADO</td><td>{esc(moeda(resultado))}</td></tr>
+      </table>{margem}
+      <div class="ed-dre-nota">Regime de caixa: lançamentos com situação <b>Pago</b> e data de pagamento no mês.</div>
+    </div>'''
+
+
 def obter_logo():
     for path in LOGO_CANDIDATES:
         if os.path.isfile(path):
@@ -1436,23 +1475,49 @@ def aplicar_estilo_global():
       div[data-testid="stMetricValue"] { color:#142b4a; }
       .stAppViewBlockContainer, .main .block-container, [data-testid="stAppViewContainer"] .block-container {
         padding-top: 1.25rem !important; padding-bottom: 2.5rem !important;
+        padding-left: 2rem !important; padding-right: 2rem !important;  /* mais área útil na tela */
       }
-      /* O wrapper do Streamlit fica sticky; o restante da página continua rolando normalmente. */
-      div[data-testid="stMarkdown"]:has(.ed-header) {
-        position: sticky; top: 0.45rem; z-index: 1000; align-self: stretch;
-        background: #f4f7fb; padding-top: 0.15rem; padding-bottom: 0.25rem;
+      @media (max-width: 700px) { .block-container { padding-left: 1rem !important; padding-right: 1rem !important; } }
+      /* CABEÇALHO FIXO: o sticky precisa ficar no container do elemento (filho direto do bloco
+         que rola). No wrapper interno (stMarkdown) não funcionava e a logo sumia ao rolar. */
+      div[data-testid="stElementContainer"]:has(.ed-header), div.element-container:has(.ed-header) {
+        position: sticky; top: 3.6rem; z-index: 999; background: #f4f7fb;
+        padding: .2rem 0 .35rem 0; margin-top: -.2rem;
       }
-      .ed-header { position:relative; top:auto; left:auto; right:auto; z-index:1; display:flex; align-items:center; gap:22px; width:100%; min-height:108px; padding:18px 22px; margin:0; box-sizing:border-box; overflow:visible; background:linear-gradient(110deg,rgba(255,255,255,.99) 0%,rgba(248,251,255,.99) 100%); border:1px solid #e5ebf3; border-radius:16px; box-shadow:0 8px 24px rgba(20,43,74,.12); }
-      .ed-header-logo { flex:0 0 82px; display:flex; align-items:center; justify-content:center; }
-      .ed-header-logo img { max-width:78px; max-height:78px; object-fit:contain; }
-      .ed-header-title { flex:1 1 auto; min-width:0; padding:4px 0; }
-      .ed-header-title h1 { margin:0 !important; padding:0 !important; color:#142b4a; font-size:clamp(1.45rem,2.4vw,2rem); line-height:1.28 !important; font-weight:800; overflow-wrap:anywhere; }
-      .ed-header-title p { margin:6px 0 0 0 !important; color:#64748b; font-size:.92rem; line-height:1.45 !important; }
-      .ed-profissional { flex:0 0 230px; text-align:right; padding:8px 0 8px 12px; min-height:68px; box-sizing:border-box; display:flex; flex-direction:column; justify-content:center; line-height:1.55; overflow:visible; border-left:1px solid #e2e8f0; }
-      .ed-profissional strong { display:block; color:#142b4a; font-size:1.02rem; white-space:normal; overflow-wrap:anywhere; margin:0 0 3px 0; }
-      .ed-profissional span { color:#64748b; font-size:.88rem; }
-      @media (max-width: 900px) { div[data-testid="stMarkdown"]:has(.ed-header) { top:0; } .ed-header { gap:12px; padding:13px 15px; flex-wrap:wrap; } .ed-header-logo { flex-basis:60px; } .ed-header-logo img { max-width:58px; max-height:58px; } .ed-profissional { flex:1 1 100%; text-align:left; border-left:0; border-top:1px solid #e2e8f0; padding:8px 0 0 0; min-height:0; } }
-      @media (min-width: 901px) and (max-width: 1100px) { .ed-header { gap:12px; padding:15px; } .ed-profissional { flex-basis:190px; } }
+      .ed-header { position:relative; display:flex; align-items:center; gap:16px; width:100%; min-height:70px; padding:9px 18px; margin:0; box-sizing:border-box; background:linear-gradient(110deg,rgba(255,255,255,.99) 0%,rgba(248,251,255,.99) 100%); border:1px solid #e5ebf3; border-radius:14px; box-shadow:0 6px 18px rgba(20,43,74,.10); }
+      .ed-header-logo { flex:0 0 56px; display:flex; align-items:center; justify-content:center; }
+      .ed-header-logo img { max-width:52px; max-height:52px; object-fit:contain; }
+      .ed-header-title { flex:1 1 auto; min-width:0; }
+      .ed-header-title h1 { margin:0 !important; padding:0 !important; color:#142b4a; font-size:clamp(1.2rem,1.9vw,1.55rem); line-height:1.2 !important; font-weight:800; overflow-wrap:anywhere; }
+      .ed-header-title p { margin:2px 0 0 0 !important; color:#64748b; font-size:.84rem; line-height:1.3 !important; }
+      .ed-profissional { flex:0 0 210px; text-align:right; padding:2px 0 2px 12px; box-sizing:border-box; display:flex; flex-direction:column; justify-content:center; line-height:1.35; border-left:1px solid #e2e8f0; }
+      .ed-profissional strong { display:block; color:#142b4a; font-size:.95rem; overflow-wrap:anywhere; }
+      .ed-profissional span { color:#64748b; font-size:.82rem; }
+      @media (max-width: 900px) { .ed-header { gap:10px; padding:8px 12px; min-height:58px; } .ed-header-logo { flex-basis:44px; } .ed-header-logo img { max-width:42px; max-height:42px; } .ed-header-title p { display:none; } .ed-profissional { display:none; } }
+      /* MENU LATERAL MAIS ESTREITO (só quando aberto; recolher continua funcionando). */
+      section[data-testid="stSidebar"][data-collapsed="false"] { width:240px !important; min-width:240px !important; max-width:240px !important; }
+      [data-testid="stSidebarContent"] { padding-bottom: .5rem; }
+      [data-testid="stSidebarHeader"] { padding: .6rem .9rem 0 .9rem !important; height:auto !important; min-height:2.2rem; }
+      [data-testid="stSidebarUserContent"] { padding: 0 .9rem 1rem .9rem !important; }
+      [data-testid="stSidebar"] h2 { font-size:1.15rem !important; padding:.2rem 0 0 0 !important; }
+      [data-testid="stSidebar"] hr { margin: .55rem 0 !important; }
+      [data-testid="stSidebar"] [role="radiogroup"] label { padding: .08rem 0 !important; }
+      [data-testid="stSidebar"] [role="radiogroup"] p { font-size: .86rem !important; white-space: nowrap; }
+      /* MINI DRE */
+      .ed-dre { background:#fff; border:1px solid #e4eaf2; border-radius:15px; padding:16px 20px 12px 20px; box-shadow:0 5px 18px rgba(20,43,74,.05); }
+      .ed-dre-titulo { font-weight:800; color:#142b4a; font-size:1.02rem; margin-bottom:8px; }
+      .ed-dre table { width:100%; border-collapse:collapse; border:0; }
+      .ed-dre td { border:0 !important; padding:5px 2px; font-variant-numeric: tabular-nums; }
+      .ed-dre td:last-child { text-align:right; white-space:nowrap; }
+      .ed-dre tr.grupo td { font-weight:700; color:#142b4a; border-top:1px solid #eef2f7 !important; padding-top:9px; }
+      .ed-dre tr.grupo:first-child td { border-top:0 !important; padding-top:4px; }
+      .ed-dre tr.menos td:last-child { color:#b45309; }
+      .ed-dre tr.det td { color:#64748b; font-size:.88rem; padding:2px 2px 2px 16px; }
+      .ed-dre tr.total td { font-weight:800; font-size:1.12rem; color:#142b4a; border-top:2px solid #142b4a !important; padding-top:10px; }
+      .ed-dre tr.total.pos td:last-child { color:#15803d; }
+      .ed-dre tr.total.neg td:last-child { color:#b91c1c; }
+      .ed-dre-margem { margin-top:6px; color:#334155; font-size:.9rem; }
+      .ed-dre-nota { margin-top:6px; color:#94a3b8; font-size:.78rem; }
       .stButton > button, .stFormSubmitButton > button { border-radius:9px; font-weight:600; min-height:2.55rem; }
       div[data-testid="stTabs"] button { font-weight:600; }
       [data-testid="stSidebar"] div.st-key-sair_sistema button { background:rgba(255,255,255,.10) !important; color:#fff !important; border:1px solid rgba(255,255,255,.28) !important; }
@@ -1487,12 +1552,17 @@ def cabecalho(logo, cfg=None):
     st.markdown(bloco, unsafe_allow_html=True)
 
 
-def exibir_grafico_barras_fino(df, categoria, valor, titulo, chave):
+# Cores da logo (peças A, B, C, D), usadas nas barras do gráfico de dificuldades.
+PALETA_LOGO = ["#3c7abf", "#e23d2d", "#57af9d", "#f0de1a"]
+
+
+def exibir_grafico_barras_fino(df, categoria, valor, titulo, chave, cores=None, texto=None):
     # Grafico horizontal com rotulos completos.
+    # cores: lista de cores aplicada barra a barra (da maior para a menor); texto: coluna do rótulo.
     if df is None or df.empty or categoria not in df.columns or valor not in df.columns:
         st.info("Não há dados suficientes para montar este gráfico.")
         return
-    graf = df[[categoria, valor]].copy()
+    graf = df[[categoria, valor] + ([texto] if texto and texto in df.columns else [])].copy()
     graf[categoria] = graf[categoria].astype(str).str.strip()
     graf[valor] = pd.to_numeric(graf[valor], errors="coerce")
     graf = graf.dropna(subset=[categoria, valor])
@@ -1502,8 +1572,13 @@ def exibir_grafico_barras_fino(df, categoria, valor, titulo, chave):
         return
     graf["__rotulo"] = graf[categoria].map(lambda x: "<br>".join(textwrap.wrap(x, width=28, break_long_words=False, break_on_hyphens=False)) or x)
     altura = max(220, min(640, 54 * len(graf) + 75))
-    fig = px.bar(graf, x=valor, y="__rotulo", orientation="h", text=valor,
+    usar_texto = texto if texto and texto in graf.columns else valor
+    fig = px.bar(graf, x=valor, y="__rotulo", orientation="h", text=usar_texto,
                  custom_data=[categoria], color_discrete_sequence=["#168b9a"])
+    if cores:
+        # graf está em ordem crescente (maior barra no topo): a maior recebe a 1ª cor da paleta.
+        n = len(graf)
+        fig.update_traces(marker_color=[cores[(n - 1 - i) % len(cores)] for i in range(n)])
     fig.update_traces(width=0.48, textposition="outside", cliponaxis=False,
         marker_line_width=0,
         hovertemplate="<b>%{customdata[0]}</b><br>" + valor + ": %{x}<extra></extra>",
@@ -1599,13 +1674,21 @@ def tela_painel(db, perfil):
     c4.metric("Atividades com prazo vencido", atividades_vencidas)
 
     if perfil in ("Admin", "Financeiro"):
+        cab, sel_mes, sel_ano = st.columns([3, 1.2, 0.8])
+        cab.subheader("Financeiro")
+        mes = sel_mes.selectbox("Mês", list(range(1, 13)), index=hoje.month - 1,
+                                format_func=lambda m: MESES[m - 1], key="painel_dre_mes")
+        ano = int(sel_ano.number_input("Ano", min_value=2020, max_value=2100, value=hoje.year, step=1,
+                                       key="painel_dre_ano"))
+        dre = dre_do_mes(db, ano, mes)
         r = resumo_financeiro(db, hoje)
-        st.subheader(f"Financeiro — {MESES[hoje.month - 1]}/{hoje.year}")
-        f1, f2, f3, f4 = st.columns(4)
-        f1.metric("A receber (em dia)", moeda(r["a_receber"]))
-        f2.metric("Em atraso", moeda(r["em_atraso"]), f"{r['qtd_atraso']} lançamento(s)", delta_color="inverse" if r["qtd_atraso"] else "off")
-        f3.metric("Recebido no mês", moeda(r["recebido_mes"]))
-        f4.metric("Saldo do mês", moeda(r["saldo_mes"]))
+        col_dre, col_pend = st.columns([1.6, 1])
+        col_dre.markdown(html_mini_dre(dre, f"Mini DRE — {MESES[mes - 1]}/{ano}"), unsafe_allow_html=True)
+        with col_pend:
+            st.metric("A receber (em dia)", moeda(r["a_receber"]), help="Receitas pendentes com vencimento a partir de hoje.")
+            st.metric("Em atraso", moeda(r["em_atraso"]), f"{r['qtd_atraso']} lançamento(s)",
+                      delta_color="inverse" if r["qtd_atraso"] else "off",
+                      help="Receitas pendentes com vencimento anterior a hoje.")
 
     st.subheader("Alunos cadastrados")
     lista = (db.query(Aluno).options(joinedload(Aluno.responsavel))
@@ -2292,7 +2375,7 @@ def _tela_folha_aberta(db, usuario, folha):
     modo_aluno = st.toggle("🖥️ Modo aluno (esconde menus)", key="modo_aluno")
     if modo_aluno:
         st.markdown("<style>[data-testid='stSidebar'],[data-testid='stSidebarCollapsedControl'],header,"
-                    "div[data-testid='stMarkdown']:has(.ed-header){display:none !important;}"
+                    "div[data-testid='stElementContainer']:has(.ed-header),div[data-testid='stMarkdown']:has(.ed-header){display:none !important;}"
                     ".block-container{padding-top:.6rem !important;max-width:100% !important;}</style>",
                     unsafe_allow_html=True)
     total = folha.total_paginas
@@ -2809,6 +2892,180 @@ def obter_link_planilha(db):
     return (cfg.valor or "").strip() if cfg else ""
 
 
+# Escala da planilha (qualitativa, com ordem): usada só para posicionar cores, nunca como nota.
+NIVEIS_INDICADOR = (("necessita", 0), ("aten", 0), ("desenvolv", 1), ("satisf", 2))
+NIVEIS_COMPREENSAO = (("não", 0), ("nao", 0), ("parcial", 1), ("sim", 2))
+CORES_NIVEL = {"N": "#f4a7a1", "N/D": "#f8c79b", "D": "#fad776", "D/S": "#c6df9b", "S": "#8fca70"}
+ROTULO_NIVEL = {"N": "Necessita de atenção", "N/D": "Necessita de atenção / Em desenvolvimento",
+                "D": "Em desenvolvimento", "D/S": "Em desenvolvimento / Satisfatório", "S": "Satisfatório"}
+
+
+def nivel_da_resposta(valor, niveis=NIVEIS_INDICADOR):
+    """Converte a resposta (pode ter duas marcações) para 0..2; None se vazia/desconhecida."""
+    texto = str(valor or "").strip().casefold()
+    if not texto or texto in VALORES_VAZIOS:
+        return None
+    achados = []
+    for parte in re.split(r"[,;\n]+", texto):
+        parte = parte.strip()
+        for chave, nivel in niveis:
+            if chave in parte:
+                achados.append(nivel)
+                break
+    return sum(achados) / len(achados) if achados else None
+
+
+def sigla_do_nivel(nivel):
+    if nivel is None:
+        return None
+    return {0: "N", 0.5: "N/D", 1: "D", 1.5: "D/S", 2: "S"}.get(round(nivel * 2) / 2)
+
+
+def nome_curto_indicador(coluna):
+    """'Participação e comportamento [Autonomia]' -> 'Autonomia'."""
+    m = re.search(r"\[(.+?)\]", str(coluna))
+    return (m.group(1) if m else str(coluna)).strip()
+
+
+def montar_mapa_pontos(df_aluno, indicadores, col_data, col_compreensao):
+    """Linhas = pontos avaliados; colunas = atendimentos em ordem. Retorna (linhas, datas)."""
+    datas = (pd.to_datetime(df_aluno[col_data], dayfirst=True, errors="coerce").dt.strftime("%d/%m").fillna("?")
+             if col_data else pd.Series([f"#{i}" for i in range(1, len(df_aluno) + 1)], index=df_aluno.index))
+    linhas = []
+    for col in indicadores:
+        linhas.append((nome_curto_indicador(col), [nivel_da_resposta(v) for v in df_aluno[col]], "indicador"))
+    if col_compreensao:
+        linhas.append(("Compreendeu o conteúdo",
+                       [nivel_da_resposta(v, NIVEIS_COMPREENSAO) for v in df_aluno[col_compreensao]], "compreensao"))
+    return linhas, list(datas)
+
+
+def grafico_mapa_pontos(linhas, datas, chave):
+    """Mapa de evolução: cada quadrado é um ponto avaliado num atendimento."""
+    escala = [[0.0, CORES_NIVEL["N"]], [0.125, CORES_NIVEL["N"]], [0.125, CORES_NIVEL["N/D"]], [0.375, CORES_NIVEL["N/D"]],
+              [0.375, CORES_NIVEL["D"]], [0.625, CORES_NIVEL["D"]], [0.625, CORES_NIVEL["D/S"]], [0.875, CORES_NIVEL["D/S"]],
+              [0.875, CORES_NIVEL["S"]], [1.0, CORES_NIVEL["S"]]]
+    z, textos, dicas = [], [], []
+    for nome, niveis, tipo in reversed(linhas):  # primeira linha no topo
+        z.append([n for n in niveis])
+        linha_txt, linha_dica = [], []
+        for n in niveis:
+            sigla = sigla_do_nivel(n)
+            if tipo == "compreensao":
+                rot = {"N": "Não", "D": "Parc.", "S": "Sim"}.get(sigla, sigla or "")
+                completo = {"N": "Não", "D": "Parcialmente", "S": "Sim"}.get(sigla, "Não registrado")
+            else:
+                rot = sigla or ""
+                completo = ROTULO_NIVEL.get(sigla, "Não registrado")
+            linha_txt.append(rot)
+            linha_dica.append(completo)
+        textos.append(linha_txt)
+        dicas.append(linha_dica)
+    nomes = [n for n, _, _ in reversed(linhas)]
+    x = list(range(len(datas)))
+    fig = go.Figure(go.Heatmap(
+        z=z, x=x, y=nomes, zmin=0, zmax=2, colorscale=escala, showscale=False, xgap=3, ygap=3,
+        text=textos, texttemplate="%{text}", textfont={"size": 11, "color": "#1f2937"},
+        customdata=[[[d, datas[i]] for i, d in enumerate(linha)] for linha in dicas],
+        hovertemplate="<b>%{y}</b><br>%{customdata[1]}: %{customdata[0]}<extra></extra>", hoverongaps=False))
+    passo = max(1, len(datas) // 14)  # muitos atendimentos: rótulo de data a cada N colunas
+    fig.update_layout(
+        height=max(230, 42 * len(nomes) + 70), margin={"l": 8, "r": 8, "t": 8, "b": 40},
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font={"family": "Arial, sans-serif", "size": 11, "color": "#334155"},
+        xaxis={"tickmode": "array", "tickvals": x[::passo], "ticktext": datas[::passo], "showgrid": False,
+               "zeroline": False, "tickangle": 0, "side": "bottom"},
+        yaxis={"showgrid": False, "zeroline": False, "automargin": True, "tickfont": {"size": 12, "color": "#142b4a"}},
+        hoverlabel={"bgcolor": "#142b4a", "font": {"color": "#ffffff"}})
+    st.plotly_chart(fig, width="stretch", key=chave, config={"displayModeBar": False, "responsive": True})
+    legenda = " ".join(
+        f'<span style="display:inline-flex;align-items:center;gap:5px;margin-right:14px">'
+        f'<span style="width:12px;height:12px;border-radius:3px;background:{CORES_NIVEL[s]};display:inline-block"></span>'
+        f'{html.escape(r)}</span>'
+        for s, r in (("N", "N · Necessita de atenção"), ("D", "D · Em desenvolvimento"), ("S", "S · Satisfatório"),
+                     ("N/D", "N/D ou D/S · duas marcações no dia")))
+    st.markdown(f'<div style="font-size:.82rem;color:#64748b;margin:-6px 0 6px 0">{legenda}</div>',
+                unsafe_allow_html=True)
+
+
+def tendencia_do_ponto(niveis):
+    """Compara os 3 primeiros com os 3 últimos registros (ordem da escala, não nota)."""
+    validos = [n for n in niveis if n is not None]
+    if len(validos) < 4:
+        return "poucos", "▬ poucos registros"
+    k = min(3, len(validos) // 2)
+    inicio, fim = sum(validos[:k]) / k, sum(validos[-k:]) / k
+    if fim - inicio > 0.3:
+        return "up", "▲ avançando"
+    if fim - inicio < -0.3:
+        return "down", "▼ atenção"
+    return "eq", "▬ estável"
+
+
+def grafico_retrato_pontos(linhas, chave):
+    """Retrato de cada ponto (todos os atendimentos) + tendência recente."""
+    indicadores = [(nome, niveis) for nome, niveis, tipo in linhas if tipo == "indicador"]
+    if not indicadores:
+        return
+    nomes, perc = [], {"S": [], "D": [], "N": []}
+    for nome, niveis in reversed(indicadores):
+        validos = [n for n in niveis if n is not None]
+        total = len(validos) or 1
+        conta = {"S": 0.0, "D": 0.0, "N": 0.0}
+        for n in validos:  # duas marcações dividem o peso entre os dois níveis
+            if n == 0.5:
+                conta["N"] += .5; conta["D"] += .5
+            elif n == 1.5:
+                conta["D"] += .5; conta["S"] += .5
+            else:
+                conta[{0: "N", 1: "D", 2: "S"}[int(n)]] += 1
+        tendencia = tendencia_do_ponto(niveis)[1]
+        nomes.append(f"{nome}   {tendencia}")
+        for k in perc:
+            perc[k].append(round(conta[k] / total * 100))
+    fig = go.Figure()
+    for k, rotulo in (("S", "Satisfatório"), ("D", "Em desenvolvimento"), ("N", "Necessita de atenção")):
+        fig.add_bar(y=nomes, x=perc[k], orientation="h", name=rotulo, marker_color=CORES_NIVEL[k],
+                    marker_line_color="#ffffff", marker_line_width=2,
+                    text=[f"{v}%" if v >= 8 else "" for v in perc[k]], textposition="inside",
+                    insidetextanchor="middle", textfont={"size": 11, "color": "#1f2937"},
+                    hovertemplate="<b>%{y}</b><br>" + rotulo + ": %{x}%<extra></extra>")
+    fig.update_layout(
+        barmode="stack", height=max(220, 40 * len(nomes) + 80), bargap=0.35,
+        margin={"l": 8, "r": 8, "t": 8, "b": 8}, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font={"family": "Arial, sans-serif", "size": 11, "color": "#334155"},
+        xaxis={"range": [0, 100], "showgrid": False, "showticklabels": False, "zeroline": False},
+        yaxis={"automargin": True, "tickfont": {"size": 12, "color": "#142b4a"}},
+        legend={"orientation": "h", "y": -0.08, "x": 0, "traceorder": "normal"},
+        hoverlabel={"bgcolor": "#142b4a", "font": {"color": "#ffffff"}})
+    st.plotly_chart(fig, width="stretch", key=chave, config={"displayModeBar": False, "responsive": True})
+    st.caption("Tendência: compara os 3 primeiros com os 3 últimos atendimentos de cada ponto, pela ordem da "
+               "escala (Necessita de atenção → Em desenvolvimento → Satisfatório). Não é nota.")
+
+
+def grafico_dificuldades(df_aluno, col_dificuldades, prefixo):
+    """Em quantos atendimentos cada dificuldade apareceu, com as cores da logo.
+
+    Anotações livres que aparecem uma única vez são agrupadas em "Outras" para não
+    poluir o gráfico (quando já existem dificuldades recorrentes).
+    """
+    contagem = dividir_categorias(df_aluno[col_dificuldades])
+    if contagem.empty:
+        return
+    total = int(limpar_respostas(df_aluno[col_dificuldades]).shape[0]) or len(df_aluno)
+    if (contagem >= 2).any():
+        unicas = contagem[contagem < 2]
+        contagem = contagem[contagem >= 2]
+        if not unicas.empty:
+            contagem = pd.concat([contagem, pd.Series({"Outras": int(unicas.sum())})])
+    df_dif = contagem.rename_axis("Dificuldade").reset_index(name="Atendimentos")
+    df_dif["Rótulo"] = df_dif["Atendimentos"].map(lambda n: f"{n} de {total} · {round(n / total * 100)}%")
+    st.subheader("🎯 Dificuldades apresentadas")
+    exibir_grafico_barras_fino(df_dif, "Dificuldade", "Atendimentos",
+                               f"Em quantos atendimentos cada dificuldade apareceu (de {total})",
+                               f"{prefixo}_graf_dif", cores=PALETA_LOGO, texto="Rótulo")
+
+
 def renderizar_analise_desempenho(df_aluno, indicadores, nome_aluno, prefixo, publico=False):
     """Análise qualitativa reutilizada na tela interna e no portal da família.
 
@@ -2816,7 +3073,11 @@ def renderizar_analise_desempenho(df_aluno, indicadores, nome_aluno, prefixo, pu
     a família veja apenas os indicadores consolidados.
     """
     col_data = localizar_coluna(df_aluno, ("data",), excluir=("carimbo",))
-    col_compreensao = localizar_coluna(df_aluno, ("compreensão",)) or localizar_coluna(df_aluno, ("compreensao",))
+    # Coluna "Aprendizagem - demonstrou compreensão do CONTEÚDO?". Antes a busca só por "compreensão"
+    # pegava "[Compreensão das orientações]" (um dos 6 pontos) e o gráfico mostrava dados errados.
+    col_compreensao = (localizar_coluna(df_aluno, ("compreens", "conte"), excluir=("orienta",))
+                       or localizar_coluna(df_aluno, ("demonstrou",))
+                       or localizar_coluna(df_aluno, ("compreens",), excluir=("orienta", "[")))
     col_dificuldades = localizar_coluna(df_aluno, ("dificuldades",))
     col_conteudo = localizar_coluna(df_aluno, ("conteúdo trabalhado",)) or localizar_coluna(df_aluno, ("conteudo trabalhado",))
 
@@ -2837,33 +3098,38 @@ def renderizar_analise_desempenho(df_aluno, indicadores, nome_aluno, prefixo, pu
                                file_name=f"desempenho_{nome_arquivo}.csv", mime="text/csv",
                                key=f"{prefixo}_csv")
 
-    st.subheader("📊 Distribuição das classificações")
     escolhas = [c for c in indicadores if not limpar_respostas(df_aluno[c]).empty]
-    if escolhas:
-        indicador_sel = st.selectbox("Indicador para analisar", escolhas, key=f"{prefixo}_indicador")
-        contagem = (limpar_respostas(df_aluno[indicador_sel]).value_counts()
-                    .rename_axis("Classificação").reset_index(name="Quantidade"))
-        exibir_grafico_barras_fino(contagem, "Classificação", "Quantidade",
-                                   f"Classificações — {indicador_sel}", f"{prefixo}_graf_class")
-        if not publico:
-            st.dataframe(contagem, width="stretch", hide_index=True)
+    if escolhas or col_compreensao:
+        linhas, datas_mapa = montar_mapa_pontos(df_aluno, escolhas, col_data, col_compreensao)
+        st.subheader("🗺️ Mapa dos pontos avaliados")
+        st.caption("Cada quadrado é um ponto avaliado num atendimento, em ordem de data.")
+        grafico_mapa_pontos(linhas, datas_mapa, f"{prefixo}_mapa")
+        if escolhas:
+            st.subheader("📊 Retrato de cada ponto")
+            grafico_retrato_pontos(linhas, f"{prefixo}_retrato")
     else:
         st.info("Ainda não há indicadores de participação preenchidos.")
 
-    st.subheader("📈 Evolução por atendimento")
-    if col_data and escolhas:
-        df_ev = df_aluno.copy()
-        df_ev["Data do atendimento"] = pd.to_datetime(df_ev[col_data], dayfirst=True, errors="coerce")
-        df_ev = df_ev.dropna(subset=["Data do atendimento"]).sort_values("Data do atendimento")
-        if not df_ev.empty:
-            tabela_ev = df_ev[["Data do atendimento"] + escolhas].copy()
-            tabela_ev["Data do atendimento"] = tabela_ev["Data do atendimento"].dt.strftime("%d/%m/%Y")
-            st.dataframe(tabela_ev, width="stretch", hide_index=True)
-            st.caption("Histórico qualitativo: as classificações não são convertidas em notas nem em escala artificial.")
-        else:
-            st.info("Não foram reconhecidas datas válidas nos atendimentos.")
-    else:
-        st.info("Ainda não há dados suficientes para mostrar a evolução.")
+    if col_dificuldades:
+        grafico_dificuldades(df_aluno, col_dificuldades, prefixo)
+
+    if escolhas:
+        with st.expander("🔎 Detalhar um ponto"):
+            indicador_sel = st.selectbox("Ponto avaliado", escolhas, key=f"{prefixo}_indicador",
+                                         format_func=nome_curto_indicador)
+            contagem = (limpar_respostas(df_aluno[indicador_sel]).value_counts()
+                        .rename_axis("Classificação").reset_index(name="Quantidade"))
+            exibir_grafico_barras_fino(contagem, "Classificação", "Quantidade",
+                                       f"Classificações — {nome_curto_indicador(indicador_sel)}", f"{prefixo}_graf_class")
+        if col_data and not publico:
+            with st.expander("📋 Tabela de evolução por atendimento"):
+                df_ev = df_aluno.copy()
+                df_ev["Data do atendimento"] = pd.to_datetime(df_ev[col_data], dayfirst=True, errors="coerce")
+                df_ev = df_ev.dropna(subset=["Data do atendimento"]).sort_values("Data do atendimento")
+                tabela_ev = df_ev[["Data do atendimento"] + escolhas].copy()
+                tabela_ev["Data do atendimento"] = tabela_ev["Data do atendimento"].dt.strftime("%d/%m/%Y")
+                tabela_ev.columns = ["Data do atendimento"] + [nome_curto_indicador(c) for c in escolhas]
+                st.dataframe(tabela_ev, width="stretch", hide_index=True)
 
     if col_compreensao:
         comp = limpar_respostas(df_aluno[col_compreensao])
@@ -2872,14 +3138,6 @@ def renderizar_analise_desempenho(df_aluno, indicadores, nome_aluno, prefixo, pu
             comp_count = comp.value_counts().rename_axis("Resposta").reset_index(name="Quantidade")
             exibir_grafico_barras_fino(comp_count, "Resposta", "Quantidade",
                                        "Respostas sobre compreensão", f"{prefixo}_graf_comp")
-
-    if col_dificuldades:
-        dificuldades = dividir_categorias(df_aluno[col_dificuldades])
-        if not dificuldades.empty:
-            st.subheader("🎯 Dificuldades observadas")
-            df_dif = dificuldades.rename_axis("Dificuldade").reset_index(name="Ocorrências")
-            exibir_grafico_barras_fino(df_dif, "Dificuldade", "Ocorrências",
-                                       "Frequência das dificuldades observadas", f"{prefixo}_graf_dif")
 
     if col_conteudo:
         conteudos = limpar_respostas(df_aluno[col_conteudo])
@@ -3578,7 +3836,7 @@ def main():
 
         with st.sidebar:
             if logo:
-                st.image(logo, width=145)
+                st.image(logo, width=104)
             st.markdown(f"## {cfg['nome_instituicao']}")
             st.caption(f"{cfg['profissional_responsavel']} · {cfg['titulo_profissional']}")
             st.divider()

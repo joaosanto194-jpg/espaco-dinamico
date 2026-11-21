@@ -71,6 +71,18 @@ Menu e acesso definidos em `MENU_PAGINAS` e `PERMISSOES`:
 - Após concluir: `aviso_folha_concluida` mostra a confirmação, e "Ver no Caderno Digital" (callback `ir_para_caderno`) troca `menu_principal` e pré-seleciona o registro. Na lista "Continuar de onde parou" há "✅ Concluir agora".
 - Ideia futura: tarefas de casa pelo portal da família usando o mesmo componente.
 
+## Painel e layout (21/11/2026)
+
+- Painel: mini DRE (`dre_do_mes` + `html_mini_dre`) em regime de caixa (Pago com data de pagamento no mês), com detalhe por categoria, margem e seletor de mês/ano. Ao lado ficam "A receber" e "Em atraso".
+- Cabeçalho fixo: o sticky fica em `div[data-testid="stElementContainer"]:has(.ed-header)` (no `stMarkdown` interno não funcionava). Cabeçalho compacto.
+- Menu lateral com 240 px: o seletor é `section[data-testid="stSidebar"][data-collapsed="false"]` (o Streamlit 1.66 não usa `aria-expanded`). Margens da página com 2rem.
+
+## Desempenho (21/11/2026)
+
+- `renderizar_analise_desempenho`: 🗺️ Mapa dos pontos avaliados (heatmap: linhas = 6 pontos + "Compreendeu o conteúdo"; colunas = atendimentos; N/D/S e duas marcações N/D, D/S), 📊 Retrato de cada ponto (barras 100% + tendência ▲▬▼ comparando os 3 primeiros com os 3 últimos, pela ordem da escala e não como nota), 🎯 Dificuldades apresentadas (`grafico_dificuldades`, cores da logo `PALETA_LOGO`, "N de total · %", itens únicos em "Outras"). "Detalhar um ponto" e a tabela de evolução ficam em painéis recolhíveis. A tabela não aparece no portal.
+- Escala lida por `nivel_da_resposta` (Necessita=0, Em desenvolvimento=1, Satisfatório=2; compreensão Não/Parcialmente/Sim).
+- A coluna de compreensão é localizada por ("compreens", "conte") excluindo "orienta". Antes pegava "[Compreensão das orientações]" por engano.
+
 ## Pendências / próximos passos
 
 1. Testar o portal da família localmente (gerar link → "Abrir o portal (testar)").
