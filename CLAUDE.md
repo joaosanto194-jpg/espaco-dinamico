@@ -83,6 +83,19 @@ Menu e acesso definidos em `MENU_PAGINAS` e `PERMISSOES`:
 - Escala lida por `nivel_da_resposta` (Necessita=0, Em desenvolvimento=1, Satisfatório=2; compreensão Não/Parcialmente/Sim).
 - A coluna de compreensão é localizada por ("compreens", "conte") excluindo "orienta". Antes pegava "[Compreensão das orientações]" por engano.
 
+## Serviços, contratos e relatório anual (21/11/2026)
+
+- Serviços oferecidos em ⚙️ Configurações (`servicos`, um por linha; `lista_servicos`). A lista suspensa aparece em Contratos (novo e edição) e no Financeiro. `opcoes_com_atual` preserva valores antigos fora da lista.
+- `lancamentos_financeiros.servico` (migração aditiva). Mensalidades geradas herdam o `descricao_servico` do contrato.
+- Novo contrato começa vazio (`index=None`, `value=None`); aluno, serviço, mensalidade e dia são obrigatórios.
+- 💰 Financeiro → 📊 Relatório anual (`tela_relatorio_anual`), em visão Caixa (pagos, pela data de pagamento) ou Competência (pelo vencimento, sem cancelados):
+  - indicadores com comparação ao mesmo período do ano anterior quando o ano está em andamento;
+  - receita recorrente dos contratos ativos e cobertura da despesa média;
+  - leituras para decisão (o "$" é escapado no Markdown);
+  - gráfico mensal, DRE anual por categoria × mês (`html_dre_anual`, sem acumulado nos meses futuros);
+  - receita por serviço e por aluno, despesas por categoria, previsto × recebido e inadimplência;
+  - exportação em Excel (openpyxl), uma aba por seção.
+
 ## Pendências / próximos passos
 
 1. Testar o portal da família localmente (gerar link → "Abrir o portal (testar)").

@@ -276,6 +276,7 @@ class LancamentoFinanceiro(Base):
     data_pagamento = Column(Date, nullable=True)
     status = Column(String(30), default="Pendente")
     observacao = Column(Text)
+    servico = Column(String(150), nullable=True)  # migração aditiva: serviço da receita (relatórios)
     aluno = relationship("Aluno")
 
 
@@ -439,6 +440,9 @@ MIGRACOES_ADITIVAS = {
         "observacoes": "TEXT",
     },
     # Caderno Digital: documentos existentes ficam PRIVADOS (visivel_familia = 0).
+    "lancamentos_financeiros": {
+        "servico": "VARCHAR(150)",
+    },
     "documentos_alunos": {
         "visivel_familia": "INTEGER NOT NULL DEFAULT 0",
         "mensagem_familia": "TEXT",
@@ -596,7 +600,25 @@ def config_padrao():
         # Usados nos recibos (opcionais).
         "documento_profissional": "",
         "cidade": "",
+        # Serviços oferecidos (um por linha): lista suspensa em Contratos e Financeiro.
+        "servicos": "Intervenção Pedagógica\nIntervenção Neuropsicopedagógica",
     }
+
+
+def lista_servicos(cfg):
+    """Serviços cadastrados em Configurações (um por linha), sem repetição."""
+    itens = []
+    for linha in str(cfg.get("servicos") or "").splitlines():
+        linha = linha.strip()
+        if linha and linha not in itens:
+            itens.append(linha)
+    return itens or ["Intervenção Pedagógica", "Intervenção Neuropsicopedagógica"]
+
+
+def opcoes_com_atual(opcoes, atual):
+    """Inclui o valor já gravado (ex.: texto antigo) para não perdê-lo ao editar."""
+    atual = (atual or "").strip()
+    return opcoes + [atual] if atual and atual not in opcoes else list(opcoes)
 
 
 def carregar_configuracoes(db):
@@ -1524,6 +1546,20 @@ def aplicar_estilo_global():
       .ed-dre tr.total.neg td:last-child { color:#b91c1c; }
       .ed-dre-margem { margin-top:6px; color:#334155; font-size:.9rem; }
       .ed-dre-nota { margin-top:6px; color:#94a3b8; font-size:.78rem; }
+      .ed-dre-anual { background:#fff; border:1px solid #e4eaf2; border-radius:15px; padding:14px 16px; box-shadow:0 5px 18px rgba(20,43,74,.05); }
+      .ed-dre-anual .rolagem { overflow-x:auto; }
+      .ed-dre-anual table { border-collapse:collapse; width:100%; min-width:1050px; font-size:.82rem; font-variant-numeric:tabular-nums; border:0; }
+      .ed-dre-anual th, .ed-dre-anual td { border:0 !important; padding:5px 6px; text-align:right; white-space:nowrap; }
+      .ed-dre-anual .cat { text-align:left; position:sticky; left:0; background:#fff; min-width:150px; }
+      .ed-dre-anual tr.cab th { color:#64748b; font-weight:600; border-bottom:1px solid #e2e8f0 !important; }
+      .ed-dre-anual tr.grupo td { font-weight:800; color:#142b4a; padding-top:12px; }
+      .ed-dre-anual td.det { color:#475569; padding-left:16px; }
+      .ed-dre-anual tr.subtotal td { font-weight:700; color:#142b4a; border-top:1px solid #e2e8f0 !important; }
+      .ed-dre-anual tr.subtotal.menos td { color:#b45309; }
+      .ed-dre-anual tr.resultado td { font-weight:800; color:#142b4a; border-top:2px solid #142b4a !important; font-size:.86rem; }
+      .ed-dre-anual tr.acum td { color:#64748b; }
+      .ed-dre-anual td.tot { font-weight:700; background:#f8fafc; }
+      .ed-dre-anual td.neg { color:#b91c1c !important; }
       .stButton > button, .stFormSubmitButton > button { border-radius:9px; font-weight:600; min-height:2.55rem; }
       div[data-testid="stTabs"] button { font-weight:600; }
       [data-testid="stSidebar"] div.st-key-sair_sistema button { background:rgba(255,255,255,.10) !important; color:#fff !important; border:1px solid rgba(255,255,255,.28) !important; }
@@ -1899,6 +1935,7 @@ def tela_gerar_mensalidades(db):
                     aluno_id=c.aluno_id, tipo="Receita", descricao=p["descricao"], categoria="Mensalidade",
                     valor=float(c.valor_mensalidade), data_vencimento=p["vencimento"], status="Pendente",
                     observacao=f"Gerado automaticamente a partir do contrato #{c.id}.",
+                    servico=c.descricao_servico,
                 ))
             db.commit()
         except SQLAlchemyError as exc:
@@ -1912,6 +1949,7 @@ def tela_gerar_mensalidades(db):
 
 def tela_contratos(db):
     st.title("Contratos e mensalidades")
+    servicos = lista_servicos(carregar_configuracoes(db))
     alunos = db.query(Aluno).filter_by(ativo=1).order_by(Aluno.nome).all()
     mapa = {f"{a.id} — {a.nome}": a.id for a in alunos}
     tab1, tab2, tab3 = st.tabs(["➕ Novo contrato", "✏️ Consultar e gerenciar contratos", "🧾 Gerar mensalidades"])
@@ -1922,20 +1960,27 @@ def tela_contratos(db):
         if not mapa:
             st.info("Cadastre um aluno ativo antes de criar um contrato.")
         else:
+            # Formulário começa VAZIO (antes já vinha com o primeiro aluno e valores preenchidos).
             with st.form("f_contrato", clear_on_submit=True):
-                aluno_label = st.selectbox("Aluno", list(mapa))
-                servico = st.text_input("Descrição do serviço", "Intervenção Neuropsicopedagógica")
-                valor = st.number_input("Mensalidade (R$)", min_value=0.0, value=350.0, step=25.0)
-                vencimento = st.number_input("Dia de vencimento", min_value=1, max_value=31, value=10)
-                inicio = st.date_input("Data de início", value=date.today(), format="DD/MM/YYYY")
+                aluno_label = st.selectbox("Aluno *", list(mapa), index=None, placeholder="Selecione o aluno")
+                servico = st.selectbox("Serviço *", servicos, index=None, placeholder="Selecione o serviço")
+                c1, c2 = st.columns(2)
+                valor = c1.number_input("Mensalidade (R$) *", min_value=0.0, value=None, step=25.0,
+                                        placeholder="Ex.: 350,00")
+                vencimento = c2.number_input("Dia de vencimento *", min_value=1, max_value=31, value=None,
+                                             step=1, placeholder="1 a 31")
+                inicio = st.date_input("Data de início", value=None, format="DD/MM/YYYY")
                 criar = st.form_submit_button("Criar contrato", type="primary")
             if criar:
-                if not servico.strip():
-                    st.error("Informe a descrição do serviço.")
+                faltando = [nome for nome, v in (("aluno", aluno_label), ("serviço", servico),
+                                                 ("mensalidade", valor), ("dia de vencimento", vencimento)) if not v]
+                if faltando:
+                    st.error("Preencha: " + ", ".join(faltando) + ".")
                 else:
                     try:
-                        db.add(Contrato(aluno_id=mapa[aluno_label], descricao_servico=servico.strip(),
-                                        valor_mensalidade=valor, dia_vencimento=int(vencimento), data_inicio=inicio, status="Ativo"))
+                        db.add(Contrato(aluno_id=mapa[aluno_label], descricao_servico=servico,
+                                        valor_mensalidade=float(valor), dia_vencimento=int(vencimento),
+                                        data_inicio=inicio or date.today(), status="Ativo"))
                         db.commit()
                         st.success("Contrato criado.")
                         st.rerun()
@@ -1956,7 +2001,11 @@ def tela_contratos(db):
         selecionado = st.selectbox("Selecione o contrato para editar", list(cmap), key="contrato_editar_sel")
         contrato = db.get(Contrato, cmap[selecionado])
         with st.form(f"f_editar_contrato_{contrato.id}"):
-            servico_e = st.text_input("Serviço", value=contrato.descricao_servico or "")
+            opcoes_serv = opcoes_com_atual(servicos, contrato.descricao_servico)
+            servico_e = st.selectbox("Serviço", opcoes_serv,
+                                     index=opcoes_serv.index(contrato.descricao_servico)
+                                     if contrato.descricao_servico in opcoes_serv else None,
+                                     placeholder="Selecione o serviço")
             valor_e = st.number_input("Mensalidade (R$)", min_value=0.0, value=float(contrato.valor_mensalidade or 0), step=25.0)
             venc_e = st.number_input("Dia de vencimento", min_value=1, max_value=31, value=int(contrato.dia_vencimento or 10))
             status_opcoes = ["Ativo", "Suspenso", "Encerrado"]
@@ -1964,10 +2013,10 @@ def tela_contratos(db):
             status_e = st.selectbox("Situação", status_opcoes, index=status_opcoes.index(status_atual))
             salvar_e = st.form_submit_button("Salvar alterações", type="primary")
         if salvar_e:
-            if not servico_e.strip():
-                st.error("Informe a descrição do serviço.")
+            if not servico_e:
+                st.error("Selecione o serviço.")
             else:
-                contrato.descricao_servico = servico_e.strip()
+                contrato.descricao_servico = servico_e
                 contrato.valor_mensalidade = float(valor_e)
                 contrato.dia_vencimento = int(venc_e)
                 contrato.status = status_e
@@ -3509,6 +3558,321 @@ def renderizar_portal_familiar(db, token, logo, cfg):
                "Em caso de dúvidas, fale diretamente com a profissional.")
 
 
+MESES_ABREV = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"]
+
+
+def numero_br(valor, casas=2):
+    return f"{float(valor or 0):,.{casas}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def lancamentos_do_ano(db, ano, regime):
+    """DataFrame dos lançamentos não cancelados do ano.
+
+    regime "caixa": pagos, pela data de pagamento. "competencia": todos, pela data de vencimento.
+    """
+    L = LancamentoFinanceiro
+    inicio, fim = date(ano, 1, 1), date(ano, 12, 31)
+    q = db.query(L).options(joinedload(L.aluno)).filter(or_(L.status.is_(None), L.status != "Cancelado"))
+    if regime == "caixa":
+        q = q.filter(L.status == "Pago", L.data_pagamento.between(inicio, fim))
+    else:
+        q = q.filter(L.data_vencimento.between(inicio, fim))
+    linhas = []
+    for l in q.all():
+        data_ref = l.data_pagamento if regime == "caixa" else l.data_vencimento
+        linhas.append({
+            "id": l.id, "tipo": l.tipo or "-", "categoria": (l.categoria or "").strip() or "Geral",
+            "servico": (l.servico or "").strip() or "Não informado", "aluno": l.aluno.nome if l.aluno else "Sem aluno",
+            "descricao": l.descricao, "valor": float(l.valor or 0), "mes": data_ref.month, "status": l.status or "Pendente",
+            "vencimento": l.data_vencimento, "pagamento": l.data_pagamento,
+        })
+    return pd.DataFrame(linhas, columns=["id", "tipo", "categoria", "servico", "aluno", "descricao", "valor", "mes",
+                                         "status", "vencimento", "pagamento"])
+
+
+def pivo_mensal(df, tipo):
+    """Categoria × mês (1..12) para um tipo (Receita/Despesa)."""
+    base = df[df["tipo"] == tipo]
+    if base.empty:
+        return pd.DataFrame(columns=list(range(1, 13)))
+    pv = base.pivot_table(index="categoria", columns="mes", values="valor", aggfunc="sum", fill_value=0.0)
+    pv = pv.reindex(columns=range(1, 13), fill_value=0.0)
+    return pv.loc[pv.sum(axis=1).sort_values(ascending=False).index]
+
+
+def html_dre_anual(rec, desp, ano, regime_txt, ate_mes=12):
+    """DRE anual em tabela: categorias nas linhas, meses nas colunas, total e participação."""
+    esc = html.escape
+    tot_r = rec.sum(axis=0) if not rec.empty else pd.Series(0.0, index=range(1, 13))
+    tot_d = desp.sum(axis=0) if not desp.empty else pd.Series(0.0, index=range(1, 13))
+    resultado = tot_r - tot_d
+    acumulado = resultado.cumsum()
+    total_r, total_d = float(tot_r.sum()), float(tot_d.sum())
+
+    def cel(v, classe=""):
+        v = float(v or 0)
+        txt = "–" if abs(v) < 0.005 else numero_br(v)
+        cls = classe + (" neg" if v < -0.005 else "")
+        return f'<td class="{cls.strip()}">{txt}</td>'
+
+    cab = "".join(f"<th>{m}</th>" for m in MESES_ABREV)
+    linhas = [f'<tr class="cab"><th class="cat">Categoria</th>{cab}<th>Total</th><th>%</th></tr>']
+
+    def bloco(titulo, pv, total, classe_total):
+        out = [f'<tr class="grupo"><td class="cat" colspan="15">{esc(titulo)}</td></tr>']
+        for cat, linha in pv.iterrows():
+            t = float(linha.sum())
+            pct = f"{t / total * 100:.1f}%".replace(".", ",") if total else "–"
+            out.append(f'<tr><td class="cat det">{esc(str(cat))}</td>' + "".join(cel(v) for v in linha)
+                       + cel(t, "tot") + f"<td>{pct}</td></tr>")
+        tot = pv.sum(axis=0) if not pv.empty else pd.Series(0.0, index=range(1, 13))
+        out.append(f'<tr class="{classe_total}"><td class="cat">Total</td>' + "".join(cel(v) for v in tot)
+                   + cel(total, "tot") + "<td>100%</td></tr>")
+        return out
+
+    linhas += bloco("RECEITAS", rec, total_r, "subtotal")
+    linhas += bloco("(−) DESPESAS", desp, total_d, "subtotal menos")
+    linhas.append('<tr class="resultado"><td class="cat">(=) RESULTADO</td>' + "".join(cel(v) for v in resultado)
+                  + cel(total_r - total_d, "tot") + "<td></td></tr>")
+    # Meses que ainda não chegaram (ano corrente) não recebem acumulado nem margem.
+    linhas.append('<tr class="acum"><td class="cat">Resultado acumulado</td>'
+                  + "".join(cel(v) if m <= ate_mes else "<td></td>" for m, v in zip(range(1, 13), acumulado))
+                  + "<td></td><td></td></tr>")
+    margens = "".join(f"<td>{(f'{(r - d) / r * 100:.0f}%'.replace('.', ',')) if r and m <= ate_mes else '–'}</td>"
+                      for m, r, d in zip(range(1, 13), tot_r, tot_d))
+    margem_ano = f"{(total_r - total_d) / total_r * 100:.1f}%".replace(".", ",") if total_r else "–"
+    linhas.append(f'<tr class="acum"><td class="cat">Margem</td>{margens}<td class="tot">{margem_ano}</td><td></td></tr>')
+    return (f'<div class="ed-dre-anual"><div class="ed-dre-titulo">DRE {ano} — {esc(regime_txt)}</div>'
+            f'<div class="rolagem"><table>{"".join(linhas)}</table></div></div>')
+
+
+def grafico_mensal_resultado(rec, desp, chave, ate_mes=12):
+    tot_r = (rec.sum(axis=0) if not rec.empty else pd.Series(0.0, index=range(1, 13))).tolist()
+    tot_d = (desp.sum(axis=0) if not desp.empty else pd.Series(0.0, index=range(1, 13))).tolist()
+    tot_r, tot_d, meses = tot_r[:ate_mes], tot_d[:ate_mes], MESES_ABREV[:ate_mes]
+    resultado = [r - d for r, d in zip(tot_r, tot_d)]
+    fig = go.Figure()
+    fig.add_bar(x=meses, y=tot_r, name="Receita", marker_color="#7cc2b2",
+                hovertemplate="%{x}: R$ %{y:,.2f}<extra>Receita</extra>")
+    fig.add_bar(x=meses, y=tot_d, name="Despesa", marker_color="#e7776c",
+                hovertemplate="%{x}: R$ %{y:,.2f}<extra>Despesa</extra>")
+    fig.add_scatter(x=meses, y=resultado, name="Resultado do mês", mode="lines+markers",
+                    line={"color": "#142b4a", "width": 2}, marker={"size": 7},
+                    hovertemplate="%{x}: R$ %{y:,.2f}<extra>Resultado</extra>")
+    fig.update_layout(barmode="group", height=330, bargap=0.3, bargroupgap=0.08,
+                      margin={"l": 8, "r": 8, "t": 10, "b": 8}, paper_bgcolor="rgba(0,0,0,0)",
+                      plot_bgcolor="rgba(0,0,0,0)", separators=",.",
+                      font={"family": "Arial, sans-serif", "size": 12, "color": "#5b6b80"},
+                      legend={"orientation": "h", "y": 1.08, "x": 0},
+                      yaxis={"gridcolor": "#e8edf4", "zeroline": True, "zerolinecolor": "#c3cad5", "tickprefix": "R$ "},
+                      xaxis={"showgrid": False}, hoverlabel={"bgcolor": "#142b4a", "font": {"color": "#ffffff"}})
+    st.plotly_chart(fig, width="stretch", key=chave, config={"displayModeBar": False, "responsive": True})
+
+
+def tabela_participacao(df, coluna, rotulo, total):
+    agg = (df.groupby(coluna)["valor"].agg(["sum", "count"]).sort_values("sum", ascending=False).reset_index())
+    agg.columns = [rotulo, "Valor", "Lançamentos"]
+    agg["Participação"] = agg["Valor"].map(lambda v: f"{v / total * 100:.1f}%".replace(".", ",") if total else "–")
+    agg["Rótulo"] = [f"R$ {numero_br(v)} · {p}" for v, p in zip(agg["Valor"], agg["Participação"])]
+    return agg
+
+
+def previsto_realizado(db, ano):
+    """Receitas com vencimento no mês (previsto) x quanto delas já foi pago (recebido)."""
+    df = lancamentos_do_ano(db, ano, "competencia")
+    df = df[df["tipo"] == "Receita"]
+    linhas = []
+    hoje = date.today()
+    for m in range(1, 13):
+        doma = df[df["mes"] == m]
+        previsto = float(doma["valor"].sum())
+        recebido = float(doma.loc[doma["status"] == "Pago", "valor"].sum())
+        atrasado = float(doma.loc[(doma["status"] != "Pago") & (doma["vencimento"] < hoje), "valor"].sum())
+        linhas.append({"Mês": MESES_ABREV[m - 1], "Previsto": previsto, "Recebido": recebido,
+                       "Em aberto": previsto - recebido, "Em atraso": atrasado,
+                       "% recebido": (recebido / previsto * 100) if previsto else None})
+    return pd.DataFrame(linhas)
+
+
+def inadimplencia_atual(db):
+    L = LancamentoFinanceiro
+    hoje = date.today()
+    itens = (db.query(L).options(joinedload(L.aluno))
+             .filter(L.tipo == "Receita", L.status == "Pendente", L.data_vencimento < hoje).all())
+    por_aluno = {}
+    for l in itens:
+        nome = l.aluno.nome if l.aluno else "Sem aluno"
+        d = por_aluno.setdefault(nome, {"Aluno": nome, "Valor em atraso": 0.0, "Lançamentos": 0, "Mais antigo": l.data_vencimento})
+        d["Valor em atraso"] += float(l.valor or 0)
+        d["Lançamentos"] += 1
+        d["Mais antigo"] = min(d["Mais antigo"], l.data_vencimento)
+    df = pd.DataFrame(sorted(por_aluno.values(), key=lambda x: -x["Valor em atraso"]))
+    if not df.empty:
+        df["Dias de atraso"] = df["Mais antigo"].map(lambda d: (hoje - d).days)
+        df["Mais antigo"] = df["Mais antigo"].map(para_str_br)
+    return df
+
+
+def leituras_para_decisao(df, rec, desp, ano, total_r, total_d, recorrente, desp_media, ant, periodo_ant=None):
+    """Frases objetivas a partir dos números (sem inventar: só o que os dados mostram)."""
+    frases = []
+    if total_r or total_d:
+        res = total_r - total_d
+        frases.append(f"{'Lucro' if res >= 0 else 'Prejuízo'} de **R$ {numero_br(abs(res))}** no período"
+                      + (f", margem de **{res / total_r * 100:.1f}%**".replace(".", ",", 1) if total_r else "") + ".")
+    tot_r = rec.sum(axis=0) if not rec.empty else None
+    if tot_r is not None and tot_r.sum() > 0:
+        m = int(tot_r.idxmax())
+        frases.append(f"Mês de maior receita: **{MESES[m - 1]}** (R$ {numero_br(tot_r.max())}).")
+    if not desp.empty and total_d:
+        cat = desp.sum(axis=1).idxmax()
+        v = float(desp.sum(axis=1).max())
+        frases.append(f"Maior despesa: **{cat}**, {v / total_d * 100:.0f}% de tudo o que saiu (R$ {numero_br(v)}).")
+    rec_df = df[df["tipo"] == "Receita"]
+    if not rec_df.empty and rec_df["aluno"].nunique() > 1:
+        top = rec_df.groupby("aluno")["valor"].sum().sort_values(ascending=False)
+        pct = top.iloc[0] / top.sum() * 100
+        if pct >= 40:
+            frases.append(f"Concentração: **{top.index[0]}** responde por {pct:.0f}% da receita. "
+                          "Perder esse aluno teria impacto grande no caixa.")
+    if recorrente:
+        cobertura = recorrente / desp_media * 100 if desp_media else None
+        txt = f"Receita recorrente dos contratos ativos: **R$ {numero_br(recorrente)}/mês**"
+        if cobertura is not None:
+            txt += (f", cobrindo **{cobertura:.0f}%** da despesa média mensal (R$ {numero_br(desp_media)})."
+                    + (" Abaixo de 100%: os contratos sozinhos não pagam as despesas." if cobertura < 100 else ""))
+        frases.append(txt + ("" if cobertura is not None else "."))
+    if ant and (ant["receita"] or ant["despesa"]):
+        def var(a, b):
+            return f"{(a - b) / b * 100:+.0f}%" if b else "novo"
+        frases.append(f"Comparado a {periodo_ant or ano - 1}: receita {var(total_r, ant['receita'])}, "
+                      f"despesa {var(total_d, ant['despesa'])}.")
+    return frases
+
+
+def tela_relatorio_anual(db):
+    hoje = date.today()
+    c1, c2, c3 = st.columns([1, 2, 2])
+    ano = int(c1.number_input("Ano", min_value=2020, max_value=2100, value=hoje.year, step=1, key="rel_ano"))
+    regime_txt = c2.radio("Visão", ["Caixa (o que foi pago)", "Competência (o que venceu)"], horizontal=True,
+                          key="rel_regime",
+                          help="Caixa: pela data de pagamento, só pagos. Competência: pela data de vencimento, "
+                               "pagos e pendentes (sem cancelados).")
+    regime = "caixa" if regime_txt.startswith("Caixa") else "competencia"
+    df = lancamentos_do_ano(db, ano, regime)
+    if df.empty:
+        st.info(f"Não há lançamentos em {ano} nesta visão.")
+        return
+    rec, desp = pivo_mensal(df, "Receita"), pivo_mensal(df, "Despesa")
+    total_r = float(df.loc[df["tipo"] == "Receita", "valor"].sum())
+    total_d = float(df.loc[df["tipo"] == "Despesa", "valor"].sum())
+    resultado = total_r - total_d
+    meses_mov = int(df["mes"].nunique()) or 1
+    desp_media = total_d / meses_mov
+    recorrente = float(db.query(func.coalesce(func.sum(Contrato.valor_mensalidade), 0))
+                       .filter(Contrato.status == "Ativo").scalar() or 0)
+    ano_corrente = ano == hoje.year
+    ate_mes = hoje.month if (ano_corrente and regime == "caixa") else 12
+    df_ant = lancamentos_do_ano(db, ano - 1, regime)
+    if ano_corrente and not df_ant.empty:
+        # Ano em andamento: compara jan..mês atual com o mesmo intervalo do ano anterior.
+        df_ant = df_ant[df_ant["mes"] <= hoje.month]
+    periodo_ant = (f"jan–{MESES_ABREV[hoje.month - 1].lower()}/{ano - 1}" if ano_corrente else str(ano - 1))
+    ant = {"receita": float(df_ant.loc[df_ant["tipo"] == "Receita", "valor"].sum()) if not df_ant.empty else 0.0,
+           "despesa": float(df_ant.loc[df_ant["tipo"] == "Despesa", "valor"].sum()) if not df_ant.empty else 0.0}
+
+    def delta(atual, anterior):
+        return f"{(atual - anterior) / anterior * 100:+.0f}% vs {periodo_ant}" if anterior else None
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Receita do ano", moeda(total_r), delta(total_r, ant["receita"]))
+    k2.metric("Despesa do ano", moeda(total_d), delta(total_d, ant["despesa"]), delta_color="inverse")
+    k3.metric("Resultado", moeda(resultado),
+              delta(resultado, ant["receita"] - ant["despesa"]) if (ant["receita"] - ant["despesa"]) > 0 else None)
+    k4.metric("Margem", f"{resultado / total_r * 100:.1f}%".replace(".", ",") if total_r else "–")
+    k5, k6, k7, k8 = st.columns(4)
+    k5.metric("Receita média/mês", moeda(total_r / meses_mov), help="Média dos meses com movimento.")
+    k6.metric("Despesa média/mês", moeda(desp_media))
+    mens = df[(df["tipo"] == "Receita") & (df["categoria"] == "Mensalidade")]
+    k7.metric("Ticket médio da mensalidade", moeda(mens["valor"].mean()) if not mens.empty else "–")
+    k8.metric("Receita recorrente (contratos)", moeda(recorrente), help="Soma das mensalidades dos contratos ativos.")
+
+    st.markdown("##### 💡 Leituras para decisão")
+    for frase in leituras_para_decisao(df, rec, desp, ano, total_r, total_d, recorrente, desp_media, ant,
+                                       periodo_ant):
+        # "$" escapado: dois "R$" na mesma linha viravam fórmula matemática no Markdown do Streamlit.
+        st.markdown("- " + frase.replace("$", "\\$"))
+
+    st.markdown("##### Receita, despesa e resultado por mês")
+    grafico_mensal_resultado(rec, desp, f"rel_mensal_{ano}_{regime}", ate_mes)
+
+    st.markdown("##### DRE anual por categoria")
+    st.markdown(html_dre_anual(rec, desp, ano, regime_txt, ate_mes), unsafe_allow_html=True)
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        receitas = df[df["tipo"] == "Receita"]
+        if not receitas.empty:
+            por_serv = tabela_participacao(receitas, "servico", "Serviço", total_r)
+            exibir_grafico_barras_fino(por_serv, "Serviço", "Valor", "Receita por serviço", f"rel_serv_{ano}",
+                                       cores=PALETA_LOGO, texto="Rótulo")
+            if (receitas["servico"] == "Não informado").any():
+                st.caption("“Não informado”: receitas sem serviço. Mensalidades novas herdam o serviço do contrato; "
+                           "nas antigas, informe em ✏️ Consultar e editar.")
+    with col_b:
+        despesas = df[df["tipo"] == "Despesa"]
+        if not despesas.empty:
+            por_cat = tabela_participacao(despesas, "categoria", "Categoria", total_d)
+            exibir_grafico_barras_fino(por_cat, "Categoria", "Valor", "Despesas por categoria", f"rel_desp_{ano}",
+                                       cores=PALETA_LOGO, texto="Rótulo")
+
+    receitas = df[df["tipo"] == "Receita"]
+    por_aluno = pd.DataFrame()
+    if not receitas.empty:
+        st.markdown("##### Receita por aluno")
+        por_aluno = tabela_participacao(receitas, "aluno", "Aluno", total_r).drop(columns=["Rótulo"])
+        st.dataframe(por_aluno.assign(Valor=por_aluno["Valor"].map(moeda)), width="stretch", hide_index=True)
+
+    st.markdown("##### Previsto × recebido (receitas pelo vencimento)")
+    pr = previsto_realizado(db, ano)
+    st.dataframe(pr.assign(**{c: pr[c].map(moeda) for c in ("Previsto", "Recebido", "Em aberto", "Em atraso")},
+                           **{"% recebido": pr["% recebido"].map(lambda v: f"{v:.0f}%" if pd.notna(v) else "–")}),
+                 width="stretch", hide_index=True)
+
+    inad = inadimplencia_atual(db)
+    st.markdown("##### Inadimplência hoje")
+    if inad.empty:
+        st.success("Nenhuma receita em atraso.")
+    else:
+        st.warning(f"{int(inad['Lançamentos'].sum())} lançamento(s) em atraso, total de "
+                   f"{moeda(inad['Valor em atraso'].sum())}.")
+        st.dataframe(inad.assign(**{"Valor em atraso": inad["Valor em atraso"].map(moeda)}),
+                     width="stretch", hide_index=True)
+
+    # Exportação: uma planilha por seção, com números (não texto) para a contadora/planilhas.
+    from io import BytesIO
+    saida = BytesIO()
+    nomes_meses = dict(zip(range(1, 13), MESES_ABREV))
+    with pd.ExcelWriter(saida, engine="openpyxl") as xl:
+        rec.rename(columns=nomes_meses).assign(Total=rec.sum(axis=1)).to_excel(xl, sheet_name="Receitas por mês")
+        desp.rename(columns=nomes_meses).assign(Total=desp.sum(axis=1)).to_excel(xl, sheet_name="Despesas por mês")
+        tot_r = rec.sum(axis=0) if not rec.empty else pd.Series(0.0, index=range(1, 13))
+        tot_d = desp.sum(axis=0) if not desp.empty else pd.Series(0.0, index=range(1, 13))
+        pd.DataFrame({"Mês": MESES_ABREV, "Receita": tot_r.values, "Despesa": tot_d.values,
+                      "Resultado": (tot_r - tot_d).values, "Acumulado": (tot_r - tot_d).cumsum().values}
+                     ).to_excel(xl, sheet_name="Resultado mensal", index=False)
+        if not por_aluno.empty:
+            por_aluno.to_excel(xl, sheet_name="Receita por aluno", index=False)
+        pr.to_excel(xl, sheet_name="Previsto x recebido", index=False)
+        if not inad.empty:
+            inad.to_excel(xl, sheet_name="Inadimplência", index=False)
+        df.drop(columns=["mes"]).to_excel(xl, sheet_name="Lançamentos", index=False)
+    st.download_button("⬇️ Baixar relatório completo (Excel)", data=saida.getvalue(),
+                       file_name=f"relatorio_financeiro_{ano}_{regime}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       key=f"rel_excel_{ano}_{regime}", width="stretch")
+
+
 def tela_financeiro(db):
     st.title("Financeiro — lançamentos")
     resumo = resumo_financeiro(db)
@@ -3523,13 +3887,20 @@ def tela_financeiro(db):
     mapa.update({f"{a.id} — {a.nome}{'' if a.ativo else ' (inativo)'}": a.id for a in alunos})
     categorias = ["Mensalidade", "Atendimento", "Material", "Aluguel", "Serviços", "Impostos", "Transporte", "Outro"]
     status_opcoes = ["Pendente", "Pago", "Cancelado"]
-    tab1, tab2 = st.tabs(["➕ Novo lançamento", "✏️ Consultar e editar lançamentos"])
+    servicos = lista_servicos(carregar_configuracoes(db))
+    tab1, tab2, tab3 = st.tabs(["➕ Novo lançamento", "✏️ Consultar e editar lançamentos", "📊 Relatório anual"])
+    # tab3 primeiro: tab2 encerra a função quando ainda não há lançamentos.
+    with tab3:
+        tela_relatorio_anual(db)
     with tab1:
         with st.form("f_financeiro_novo", clear_on_submit=True):
             tipo = st.selectbox("Tipo", ["Receita", "Despesa"])
             descricao = st.text_input("Descrição *")
-            categoria = st.selectbox("Categoria", categorias)
-            valor = st.number_input("Valor (R$)", min_value=0.01, value=100.0, step=10.0)
+            c_cat, c_serv = st.columns(2)
+            categoria = c_cat.selectbox("Categoria", categorias)
+            servico = c_serv.selectbox("Serviço (receitas)", servicos, index=None, placeholder="Não se aplica",
+                                       help="Usado no relatório anual para separar a receita por serviço.")
+            valor = st.number_input("Valor (R$) *", min_value=0.01, value=None, step=10.0, placeholder="Ex.: 350,00")
             vencimento = st.date_input("Data de vencimento", value=date.today(), format="DD/MM/YYYY")
             aluno_label = st.selectbox("Aluno (opcional)", list(mapa))
             c_pag1, c_pag2 = st.columns(2)
@@ -3538,11 +3909,12 @@ def tela_financeiro(db):
             observacao = st.text_area("Observação")
             salvar = st.form_submit_button("Registrar lançamento", type="primary")
         if salvar:
-            if not descricao.strip():
-                st.error("Informe uma descrição.")
+            if not descricao.strip() or not valor:
+                st.error("Informe a descrição e o valor.")
             else:
                 try:
                     db.add(LancamentoFinanceiro(tipo=tipo, descricao=descricao.strip(), categoria=categoria,
+                        servico=servico if tipo == "Receita" else None,
                         valor=float(valor), data_vencimento=vencimento, aluno_id=mapa[aluno_label],
                         observacao=observacao.strip(), status="Pago" if ja_pago else "Pendente",
                         data_pagamento=data_pag if ja_pago else None))
@@ -3573,7 +3945,7 @@ def tela_financeiro(db):
             filtrados = [l for l in todos if l.status == filtro]
         st.dataframe(pd.DataFrame([{
             "ID": l.id, "Tipo": l.tipo, "Descrição": l.descricao, "Categoria": l.categoria,
-            "Valor": moeda(l.valor), "Vencimento": para_str_br(l.data_vencimento),
+            "Serviço": l.servico or "-", "Valor": moeda(l.valor), "Vencimento": para_str_br(l.data_vencimento),
             "Pagamento": para_str_br(l.data_pagamento), "Situação": situacao_exibida(l),
             "Aluno": l.aluno.nome if l.aluno else "-"
         } for l in filtrados]), width="stretch", hide_index=True)
@@ -3586,7 +3958,12 @@ def tela_financeiro(db):
                 tipo_e = st.selectbox("Tipo", ["Receita", "Despesa"], index=["Receita", "Despesa"].index(lanc.tipo if lanc.tipo in ["Receita", "Despesa"] else "Receita"))
                 descricao_e = st.text_input("Descrição", value=lanc.descricao)
                 cat_atual = lanc.categoria if lanc.categoria in categorias else "Outro"
-                categoria_e = st.selectbox("Categoria", categorias, index=categorias.index(cat_atual))
+                c_cat_e, c_serv_e = st.columns(2)
+                categoria_e = c_cat_e.selectbox("Categoria", categorias, index=categorias.index(cat_atual))
+                opcoes_serv = opcoes_com_atual(servicos, lanc.servico)
+                servico_e = c_serv_e.selectbox("Serviço (receitas)", opcoes_serv,
+                                               index=opcoes_serv.index(lanc.servico) if lanc.servico in opcoes_serv else None,
+                                               placeholder="Não se aplica")
                 valor_e = st.number_input("Valor (R$)", min_value=0.01, value=max(0.01, float(lanc.valor or 0)), step=10.0)
                 venc_e = st.date_input("Data de vencimento", value=lanc.data_vencimento or date.today(), format="DD/MM/YYYY")
                 aluno_e = st.selectbox("Aluno (opcional)", list(mapa), index=list(mapa).index(atual_aluno))
@@ -3602,6 +3979,7 @@ def tela_financeiro(db):
                     lanc.tipo = tipo_e
                     lanc.descricao = descricao_e.strip()
                     lanc.categoria = categoria_e
+                    lanc.servico = servico_e if tipo_e == "Receita" else None
                     lanc.valor = float(valor_e)
                     lanc.data_vencimento = venc_e
                     lanc.aluno_id = mapa[aluno_e]
@@ -3630,7 +4008,7 @@ def tela_financeiro(db):
             st.caption("Não exclua lançamentos pagos para preservar a trilha financeira. Se necessário, marque como Cancelado e registre a justificativa na observação.")
         csv = pd.DataFrame([{
             "ID": l.id, "Tipo": l.tipo, "Descrição": l.descricao, "Categoria": l.categoria,
-            "Valor": l.valor, "Vencimento": para_str_br(l.data_vencimento),
+            "Serviço": l.servico or "", "Valor": l.valor, "Vencimento": para_str_br(l.data_vencimento),
             "Pagamento": para_str_br(l.data_pagamento), "Situação": l.status,
             "Aluno": l.aluno.nome if l.aluno else "", "Observação": l.observacao or ""
         } for l in todos]).to_csv(index=False).encode("utf-8-sig")
@@ -3756,6 +4134,8 @@ def tela_configuracoes(db):
         documento_prof = c_doc.text_input("CPF/CNPJ ou registro profissional (recibos)", value=atual["documento_profissional"],
                                           placeholder="ex.: CNPJ 00.000.000/0001-00")
         cidade = c_cid.text_input("Cidade/UF (recibos)", value=atual["cidade"], placeholder="ex.: Vitória/ES")
+        servicos_txt = st.text_area("Serviços oferecidos (um por linha)", value=atual["servicos"],
+                                    help="Aparecem como lista suspensa em Contratos e no Financeiro.")
         salvar = st.form_submit_button("Salvar configurações", type="primary")
     if salvar:
         app_url_limpa = app_url.strip().rstrip("/")
@@ -3769,6 +4149,7 @@ def tela_configuracoes(db):
                 "app_url": app_url_limpa,
                 "documento_profissional": documento_prof.strip(),
                 "cidade": cidade.strip(),
+                "servicos": "\n".join(lista_servicos({"servicos": servicos_txt})),
             }
             try:
                 for chave, valor in valores.items():
