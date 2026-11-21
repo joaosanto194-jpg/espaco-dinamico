@@ -881,11 +881,17 @@ def dre_do_mes(db, ano, mes):
     inicio = date(ano, mes, 1)
     fim = date(ano, mes, calendar.monthrange(ano, mes)[1])
     L = LancamentoFinanceiro
-    linhas = (db.query(L.tipo, func.coalesce(L.categoria, "Geral"), func.coalesce(func.sum(L.valor), 0))
+    # Agrupa pela coluna pura: no PostgreSQL, COALESCE(categoria, 'Geral') no SELECT e no GROUP BY vira
+    # dois parâmetros diferentes e dá GroupingError (o SQLite aceitava). Categoria vazia vira "Geral" aqui.
+    linhas = (db.query(L.tipo, L.categoria, func.coalesce(func.sum(L.valor), 0))
               .filter(L.status == "Pago", L.data_pagamento.between(inicio, fim))
-              .group_by(L.tipo, func.coalesce(L.categoria, "Geral")).all())
-    receitas = sorted(((c, float(v)) for t, c, v in linhas if t == "Receita"), key=lambda x: -x[1])
-    despesas = sorted(((c, float(v)) for t, c, v in linhas if t == "Despesa"), key=lambda x: -x[1])
+              .group_by(L.tipo, L.categoria).all())
+    somas = {}
+    for tipo, categoria, valor in linhas:
+        chave = (tipo, (categoria or "").strip() or "Geral")
+        somas[chave] = somas.get(chave, 0.0) + float(valor or 0)
+    receitas = sorted(((c, v) for (t, c), v in somas.items() if t == "Receita"), key=lambda x: -x[1])
+    despesas = sorted(((c, v) for (t, c), v in somas.items() if t == "Despesa"), key=lambda x: -x[1])
     total_r = sum(v for _, v in receitas)
     total_d = sum(v for _, v in despesas)
     return {"receitas": receitas, "despesas": despesas, "receita": total_r, "despesa": total_d,
@@ -1553,7 +1559,7 @@ def cabecalho(logo, cfg=None):
 
 
 # Cores da logo (peças A, B, C, D), usadas nas barras do gráfico de dificuldades.
-PALETA_LOGO = ["#3c7abf", "#e23d2d", "#57af9d", "#f0de1a"]
+PALETA_LOGO = ["#6b9bd2", "#e7776c", "#7cc2b2", "#efdc5c"]  # tons da logo, levemente suavizados
 
 
 def exibir_grafico_barras_fino(df, categoria, valor, titulo, chave, cores=None, texto=None):
@@ -1582,7 +1588,7 @@ def exibir_grafico_barras_fino(df, categoria, valor, titulo, chave, cores=None, 
     fig.update_traces(width=0.48, textposition="outside", cliponaxis=False,
         marker_line_width=0,
         hovertemplate="<b>%{customdata[0]}</b><br>" + valor + ": %{x}<extra></extra>",
-        textfont={"size": 11, "color": "#334155"})
+        textfont={"size": 12, "color": "#5b6b80"})
     fig.update_layout(title={"text": titulo, "x": 0, "xanchor": "left", "font": {"size": 16, "color": "#142b4a"}},
         height=altura, autosize=True, showlegend=False,
         margin={"l": 18, "r": 55, "t": 62, "b": 24},
@@ -2895,7 +2901,9 @@ def obter_link_planilha(db):
 # Escala da planilha (qualitativa, com ordem): usada só para posicionar cores, nunca como nota.
 NIVEIS_INDICADOR = (("necessita", 0), ("aten", 0), ("desenvolv", 1), ("satisf", 2))
 NIVEIS_COMPREENSAO = (("não", 0), ("nao", 0), ("parcial", 1), ("sim", 2))
-CORES_NIVEL = {"N": "#f4a7a1", "N/D": "#f8c79b", "D": "#fad776", "D/S": "#c6df9b", "S": "#8fca70"}
+CORES_NIVEL = {"N": "#f6cdc7", "N/D": "#f8dcc1", "D": "#f7eaa9", "D/S": "#d3ebe4", "S": "#a9dacd"}
+# Texto de cada nível: tom escuro da própria cor (contraste suave, mais nítido que preto).
+TEXTO_NIVEL = {"N": "#9f3a31", "N/D": "#94561c", "D": "#7a6510", "D/S": "#3b7a6b", "S": "#1f6656"}
 ROTULO_NIVEL = {"N": "Necessita de atenção", "N/D": "Necessita de atenção / Em desenvolvimento",
                 "D": "Em desenvolvimento", "D/S": "Em desenvolvimento / Satisfatório", "S": "Satisfatório"}
 
@@ -2965,9 +2973,13 @@ def grafico_mapa_pontos(linhas, datas, chave):
     x = list(range(len(datas)))
     fig = go.Figure(go.Heatmap(
         z=z, x=x, y=nomes, zmin=0, zmax=2, colorscale=escala, showscale=False, xgap=3, ygap=3,
-        text=textos, texttemplate="%{text}", textfont={"size": 11, "color": "#1f2937"},
         customdata=[[[d, datas[i]] for i, d in enumerate(linha)] for linha in dicas],
         hovertemplate="<b>%{y}</b><br>%{customdata[1]}: %{customdata[0]}<extra></extra>", hoverongaps=False))
+    for iy, (linha_txt, linha_z) in enumerate(zip(textos, z)):
+        for ix, (rot, nivel) in enumerate(zip(linha_txt, linha_z)):
+            if rot:
+                fig.add_annotation(x=ix, y=nomes[iy], text=rot, showarrow=False,
+                                   font={"size": 12, "color": TEXTO_NIVEL.get(sigla_do_nivel(nivel), "#475569")})
     passo = max(1, len(datas) // 14)  # muitos atendimentos: rótulo de data a cada N colunas
     fig.update_layout(
         height=max(230, 42 * len(nomes) + 70), margin={"l": 8, "r": 8, "t": 8, "b": 40},
@@ -3028,7 +3040,7 @@ def grafico_retrato_pontos(linhas, chave):
         fig.add_bar(y=nomes, x=perc[k], orientation="h", name=rotulo, marker_color=CORES_NIVEL[k],
                     marker_line_color="#ffffff", marker_line_width=2,
                     text=[f"{v}%" if v >= 8 else "" for v in perc[k]], textposition="inside",
-                    insidetextanchor="middle", textfont={"size": 11, "color": "#1f2937"},
+                    insidetextanchor="middle", textfont={"size": 12, "color": TEXTO_NIVEL[k]},
                     hovertemplate="<b>%{y}</b><br>" + rotulo + ": %{x}%<extra></extra>")
     fig.update_layout(
         barmode="stack", height=max(220, 40 * len(nomes) + 80), bargap=0.35,

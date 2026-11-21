@@ -73,7 +73,7 @@ Menu e acesso definidos em `MENU_PAGINAS` e `PERMISSOES`:
 
 ## Painel e layout (21/11/2026)
 
-- Painel: mini DRE (`dre_do_mes` + `html_mini_dre`) em regime de caixa (Pago com data de pagamento no mês), com detalhe por categoria, margem e seletor de mês/ano. Ao lado ficam "A receber" e "Em atraso".
+- Painel: mini DRE (`dre_do_mes` + `html_mini_dre`; agrupa por `categoria` pura, porque `COALESCE` no GROUP BY quebra no PostgreSQL) em regime de caixa (Pago com data de pagamento no mês), com detalhe por categoria, margem e seletor de mês/ano. Ao lado ficam "A receber" e "Em atraso".
 - Cabeçalho fixo: o sticky fica em `div[data-testid="stElementContainer"]:has(.ed-header)` (no `stMarkdown` interno não funcionava). Cabeçalho compacto.
 - Menu lateral com 240 px: o seletor é `section[data-testid="stSidebar"][data-collapsed="false"]` (o Streamlit 1.66 não usa `aria-expanded`). Margens da página com 2rem.
 
