@@ -102,6 +102,12 @@ Menu e acesso definidos em `MENU_PAGINAS` e `PERMISSOES`:
 - O Painel tem o filtro de situação e mostra a métrica de inativos. Prontuários e Desempenho (análise) têm a opção "Incluir alunos inativos". As telas de criação (novo contrato, nova atividade, atividade com caneta, links da família) continuam só com alunos ativos.
 - Funções auxiliares: `SITUACOES_ALUNO`, `filtrar_por_situacao`, `rotulo_aluno` (sufixo "(inativo)").
 
+## Portal da família por seções (21/11/2026)
+
+- Cada link (`links_familiares`) guarda o que a família vê: `ver_caderno`, `ver_desempenho`, `ver_atividades` (colunas aditivas com padrão 1, então links antigos veem tudo). `SECOES_PORTAL` e `secoes_do_link`.
+- A escolha é feita ao gerar o link (📈 Desempenho → 🔗 Links) e pode ser mudada depois em "Mudar o que a família vê", sem gerar novo link. O bloco do Caderno avisa quando o link não mostra o Caderno.
+- O portal mostra só as seções liberadas, em abas quando há mais de uma.
+
 ## Situação (21/11/2026)
 
 **Homologado pela usuária e em uso no Streamlit Cloud** (app publicado com PostgreSQL/Supabase e Storage configurados). Novos ajustes só quando ela acionar. Antes de cada publicação: backup CSV do Supabase em `backups_banco/`, testes locais (SQLite + Storage simulado) e conferência no PostgreSQL, que é mais rígido que o SQLite (ex.: GROUP BY).

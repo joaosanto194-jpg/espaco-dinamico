@@ -296,6 +296,10 @@ class LinkFamiliar(Base):
     criado_por = Column(String(100), nullable=True)
     acessos = Column(Integer, nullable=False, default=0)
     ultimo_acesso = Column(DateTime, nullable=True)
+    # O que a família vê neste link (migração aditiva; links antigos continuam vendo tudo).
+    ver_caderno = Column(Integer, nullable=False, default=1, server_default="1")
+    ver_desempenho = Column(Integer, nullable=False, default=1, server_default="1")
+    ver_atividades = Column(Integer, nullable=False, default=1, server_default="1")
     aluno = relationship("Aluno")
 
 
@@ -440,6 +444,11 @@ MIGRACOES_ADITIVAS = {
         "observacoes": "TEXT",
     },
     # Caderno Digital: documentos existentes ficam PRIVADOS (visivel_familia = 0).
+    "links_familiares": {
+        "ver_caderno": "INTEGER NOT NULL DEFAULT 1",
+        "ver_desempenho": "INTEGER NOT NULL DEFAULT 1",
+        "ver_atividades": "INTEGER NOT NULL DEFAULT 1",
+    },
     "lancamentos_financeiros": {
         "servico": "VARCHAR(150)",
     },
@@ -665,8 +674,20 @@ def hash_token(token):
     return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
 
 
-def gerar_link_familiar(db, aluno_id, dias_validade, criado_por, revogar_anteriores=True):
-    """Gera token aleatório; no banco fica apenas o hash (o link não pode ser lido do banco)."""
+SECOES_PORTAL = {"ver_caderno": "📓 Caderno Digital", "ver_desempenho": "📈 Desempenho",
+                 "ver_atividades": "📁 Atividades"}
+
+
+def secoes_do_link(link):
+    return [rot for campo, rot in SECOES_PORTAL.items() if getattr(link, campo, 1)]
+
+
+def gerar_link_familiar(db, aluno_id, dias_validade, criado_por, revogar_anteriores=True, secoes=None):
+    """Gera token aleatório; no banco fica apenas o hash (o link não pode ser lido do banco).
+
+    secoes: dict {"ver_caderno": bool, ...}; ausente = família vê todas as seções.
+    """
+    secoes = secoes or {}
     token = secrets.token_urlsafe(32)
     if revogar_anteriores:
         db.query(LinkFamiliar).filter_by(aluno_id=aluno_id, ativo=1).update({"ativo": 0})
@@ -674,6 +695,7 @@ def gerar_link_familiar(db, aluno_id, dias_validade, criado_por, revogar_anterio
         aluno_id=aluno_id, token_hash=hash_token(token), criado_em=datetime.now(),
         expira_em=date.today() + timedelta(days=int(dias_validade)), ativo=1,
         criado_por=criado_por, acessos=0,
+        **{campo: 1 if secoes.get(campo, True) else 0 for campo in SECOES_PORTAL},
     ))
     db.commit()
     return token
@@ -3332,9 +3354,9 @@ def tela_links_familiares(db, usuario, alunos):
     app_url = cfg.get("app_url", "") or detectar_url_base()
     local = eh_endereco_local(app_url)
     st.markdown(
-        "Gere um **link individual** para a família acompanhar o desempenho, sem login. "
-        "A família vê somente: o **📓 Caderno Digital** (apenas registros marcados com 👪), indicadores de "
-        "participação, evolução, compreensão, dificuldades, conteúdos trabalhados e atividades. "
+        "Gere um **link individual por aluno** para a família acompanhar, sem login. Você escolhe o que ela vê: "
+        "**📓 Caderno Digital** (só registros marcados com 👪), **📈 Desempenho** (mapa dos pontos, retrato, "
+        "dificuldades, compreensão) e **📁 Atividades**. "
         "**Prontuário, hipóteses, anotações internas e financeiro nunca aparecem.**"
     )
     if not app_url:
@@ -3348,12 +3370,20 @@ def tela_links_familiares(db, usuario, alunos):
     with st.form("f_gerar_link_familiar"):
         aluno_sel = st.selectbox("Aluno", list(mapa))
         validade = st.selectbox("Validade", [30, 90, 180, 365], index=2, format_func=lambda d: f"{d} dias")
+        st.markdown("**O que a família vê neste link**")
+        s1, s2, s3 = st.columns(3)
+        escolha_secoes = {"ver_caderno": s1.checkbox(SECOES_PORTAL["ver_caderno"], value=True),
+                          "ver_desempenho": s2.checkbox(SECOES_PORTAL["ver_desempenho"], value=True),
+                          "ver_atividades": s3.checkbox(SECOES_PORTAL["ver_atividades"], value=True)}
         revogar = st.checkbox("Revogar links anteriores deste aluno", value=True)
         gerar = st.form_submit_button("Gerar link", type="primary")
+    if gerar and not any(escolha_secoes.values()):
+        st.error("Marque pelo menos uma seção para a família ver.")
+        gerar = False
     if gerar:
         aluno = mapa[aluno_sel]
         try:
-            token = gerar_link_familiar(db, aluno.id, validade, usuario.nome, revogar)
+            token = gerar_link_familiar(db, aluno.id, validade, usuario.nome, revogar, escolha_secoes)
         except SQLAlchemyError as exc:
             db.rollback()
             mensagem_erro(exc, "geração do link")
@@ -3363,7 +3393,8 @@ def tela_links_familiares(db, usuario, alunos):
                 "url": montar_url_portal(app_url, token),
                 "validade": para_str_br(date.today() + timedelta(days=validade)),
             }
-            registrar_auditoria("link_familiar_gerado", f"aluno_id={aluno.id}; validade={validade} dias", usuario.nome)
+            registrar_auditoria("link_familiar_gerado", f"aluno_id={aluno.id}; validade={validade} dias; secoes="
+                                + ",".join(c for c, v in escolha_secoes.items() if v), usuario.nome)
 
     gerado = st.session_state.get("ultimo_link_gerado")
     if gerado:
@@ -3401,10 +3432,37 @@ def tela_links_familiares(db, usuario, alunos):
         "ID": l.id, "Aluno": l.aluno.nome if l.aluno else "-", "Criado em": formatar_data_hora(l.criado_em),
         "Válido até": para_str_br(l.expira_em), "Situação": situacao(l), "Acessos": l.acessos or 0,
         "Último acesso": formatar_data_hora(l.ultimo_acesso) if l.ultimo_acesso else "-",
+        "Família vê": " · ".join(r.split(" ", 1)[1] for r in secoes_do_link(l)) or "-",
         "Criado por": l.criado_por or "-",
     } for l in links]), width="stretch", hide_index=True)
     ativos = [l for l in links if situacao(l) == "Ativo"]
     if ativos:
+        st.markdown("##### ⚙️ Mudar o que a família vê (sem gerar novo link)")
+        op_edit = {f"#{l.id} — {l.aluno.nome if l.aluno else '-'} — até {para_str_br(l.expira_em)}": l.id for l in ativos}
+        link_ed = db.get(LinkFamiliar, op_edit[st.selectbox("Link ativo", list(op_edit), key="secoes_link_sel")])
+        with st.form(f"f_secoes_link_{link_ed.id}"):
+            e1, e2, e3 = st.columns(3)
+            novas = {"ver_caderno": e1.checkbox(SECOES_PORTAL["ver_caderno"], value=bool(link_ed.ver_caderno)),
+                     "ver_desempenho": e2.checkbox(SECOES_PORTAL["ver_desempenho"], value=bool(link_ed.ver_desempenho)),
+                     "ver_atividades": e3.checkbox(SECOES_PORTAL["ver_atividades"], value=bool(link_ed.ver_atividades))}
+            salvar_secoes = st.form_submit_button("Salvar o que a família vê", type="primary")
+        if salvar_secoes:
+            if not any(novas.values()):
+                st.error("Marque pelo menos uma seção.")
+            else:
+                try:
+                    for campo, valor in novas.items():
+                        setattr(link_ed, campo, 1 if valor else 0)
+                    db.commit()
+                except SQLAlchemyError as exc:
+                    db.rollback()
+                    mensagem_erro(exc, "alteração do link")
+                else:
+                    registrar_auditoria("link_familiar_secoes", f"link_id={link_ed.id}; secoes="
+                                        + ",".join(c for c, v in novas.items() if v), usuario.nome)
+                    st.success("Pronto: a família já vê a nova configuração no mesmo link.")
+                    st.rerun()
+        st.markdown("##### 🚫 Revogar um link")
         opcoes = {f"#{l.id} — {l.aluno.nome if l.aluno else '-'} — até {para_str_br(l.expira_em)}": l.id for l in ativos}
         escolha = st.selectbox("Revogar um link ativo", list(opcoes), key="revogar_link_sel")
         if st.button("Revogar link selecionado", key="revogar_link_btn"):
@@ -3516,8 +3574,12 @@ def bloco_link_familia(db, usuario, aluno, prefixo):
     ativos = links_ativos_do_aluno(db, aluno.id)
     if ativos:
         l = ativos[0]
+        secoes = " · ".join(secoes_do_link(l)) or "nada"
         st.success(f"🔗 A família de {aluno.nome} tem link ativo até {para_str_br(l.expira_em)} "
-                   f"(aberto {l.acessos or 0} vez(es)). O registro aparece lá assim que for compartilhado.")
+                   f"(aberto {l.acessos or 0} vez(es)). Ela vê: {secoes}.")
+        if not l.ver_caderno:
+            st.warning("Este link **não mostra o Caderno Digital**. Para liberar: 📈 Desempenho → 🔗 Links para as "
+                       "famílias → Mudar o que a família vê.")
         rotulo = "Gerar um novo link (a família perdeu o anterior)"
     else:
         st.warning(f"⚠️ A família de {aluno.nome} ainda **não tem link** para o portal: sem ele, ela não vê nada.")
@@ -3626,33 +3688,41 @@ def renderizar_portal_familiar(db, token, logo, cfg):
     st.header(f"Acompanhamento de {aluno.nome}")  # header: título menor, sem quebrar palavra no celular
     st.caption(f"Link pessoal válido até {para_str_br(link.expira_em)}. Por favor, não compartilhe.")
 
-    renderizar_caderno_portal(db, link, aluno)
-
-    st.subheader("📈 Desempenho nos atendimentos")
-    link_planilha = obter_link_planilha(db)
-    df = carregar_planilha_observacao_atendimento(link_planilha) if link_planilha else None
-    df_aluno, indicadores = (filtrar_e_analisar_aluno(df, aluno.nome)
-                             if df is not None and not df.empty else (pd.DataFrame(), []))
-    if df_aluno.empty:
-        st.info("Os registros de atendimento ainda não estão disponíveis. Volte em breve.")
-    else:
-        renderizar_analise_desempenho(df_aluno, indicadores, aluno.nome, "portal", publico=True)
-
-    st.subheader("📁 Atividades pedagógicas")
-    atividades = (db.query(AtividadeAluno)
-                  # No SQL, "status != 'Cancelada'" descarta status NULL; o or_ mantém esses registros.
-                  .filter(AtividadeAluno.aluno_id == aluno.id,
-                          or_(AtividadeAluno.status.is_(None), AtividadeAluno.status != "Cancelada"))
-                  .order_by(AtividadeAluno.data_atividade.desc(), AtividadeAluno.id.desc())
-                  .limit(50).all())
-    if atividades:
-        st.dataframe(pd.DataFrame([{
-            "Data": para_str_br(a.data_atividade), "Atividade": a.titulo,
-            "Área": a.area or a.categoria or "-", "Situação": normalizar_status_atividade(a.status),
-            "Objetivo": a.objetivo or "-",
-        } for a in atividades]), width="stretch", hide_index=True)
-    else:
-        st.info("Ainda não há atividades registradas.")
+    # Só as seções liberadas para ESTE link (parametrizado por aluno na tela de links).
+    secoes = [(campo, rot) for campo, rot in SECOES_PORTAL.items() if getattr(link, campo, 1)]
+    if not secoes:
+        st.info("Nada foi liberado neste link ainda. Fale com a profissional.")
+    abas = st.tabs([rot for _, rot in secoes]) if len(secoes) > 1 else [st.container() for _ in secoes]
+    for (campo, _), aba in zip(secoes, abas):
+        with aba:
+            if campo == "ver_caderno":
+                renderizar_caderno_portal(db, link, aluno)
+            elif campo == "ver_desempenho":
+                st.subheader("📈 Desempenho nos atendimentos")
+                link_planilha = obter_link_planilha(db)
+                df = carregar_planilha_observacao_atendimento(link_planilha) if link_planilha else None
+                df_aluno, indicadores = (filtrar_e_analisar_aluno(df, aluno.nome)
+                                         if df is not None and not df.empty else (pd.DataFrame(), []))
+                if df_aluno.empty:
+                    st.info("Os registros de atendimento ainda não estão disponíveis. Volte em breve.")
+                else:
+                    renderizar_analise_desempenho(df_aluno, indicadores, aluno.nome, "portal", publico=True)
+            elif campo == "ver_atividades":
+                st.subheader("📁 Atividades pedagógicas")
+                atividades = (db.query(AtividadeAluno)
+                              # "status != 'Cancelada'" descarta NULL no SQL; o or_ mantém esses registros.
+                              .filter(AtividadeAluno.aluno_id == aluno.id,
+                                      or_(AtividadeAluno.status.is_(None), AtividadeAluno.status != "Cancelada"))
+                              .order_by(AtividadeAluno.data_atividade.desc(), AtividadeAluno.id.desc())
+                              .limit(50).all())
+                if atividades:
+                    st.dataframe(pd.DataFrame([{
+                        "Data": para_str_br(a.data_atividade), "Atividade": a.titulo,
+                        "Área": a.area or a.categoria or "-", "Situação": normalizar_status_atividade(a.status),
+                        "Objetivo": a.objetivo or "-",
+                    } for a in atividades]), width="stretch", hide_index=True)
+                else:
+                    st.info("Ainda não há atividades registradas.")
     st.divider()
     st.caption(f"{cfg['nome_instituicao']} · {cfg['profissional_responsavel']} · {cfg['titulo_profissional']}. "
                "Em caso de dúvidas, fale diretamente com a profissional.")
