@@ -1702,6 +1702,7 @@ def tela_painel(db, perfil):
     st.title("Painel de gestão")
     hoje = date.today()
     alunos = db.query(func.count(Aluno.id)).filter(Aluno.ativo == 1).scalar() or 0
+    inativos = db.query(func.count(Aluno.id)).filter(Aluno.ativo != 1).scalar() or 0
     responsaveis = db.query(func.count(Responsavel.id)).scalar() or 0
     contratos = db.query(func.count(Contrato.id)).filter(Contrato.status == "Ativo").scalar() or 0
     atividades_vencidas = db.query(func.count(AtividadeAluno.id)).filter(
@@ -1710,7 +1711,8 @@ def tela_painel(db, perfil):
             ~AtividadeAluno.status.in_(["Realizada", "Realizado", "Cancelada"])),
     ).scalar() or 0
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Alunos ativos", alunos)
+    c1.metric("Alunos ativos", alunos, f"{inativos} inativo(s)" if inativos else None, delta_color="off",
+              delta_arrow="off")
     c2.metric("Responsáveis", responsaveis)
     c3.metric("Contratos ativos", contratos)
     c4.metric("Atividades com prazo vencido", atividades_vencidas)
@@ -1732,24 +1734,110 @@ def tela_painel(db, perfil):
                       delta_color="inverse" if r["qtd_atraso"] else "off",
                       help="Receitas pendentes com vencimento anterior a hoje.")
 
-    st.subheader("Alunos cadastrados")
-    lista = (db.query(Aluno).options(joinedload(Aluno.responsavel))
-             .filter(Aluno.ativo == 1).order_by(Aluno.nome).all())
+    cab_al, fil_al = st.columns([3, 2])
+    cab_al.subheader("Alunos cadastrados")
+    situacao = fil_al.radio("Mostrar", SITUACOES_ALUNO, horizontal=True, key="painel_alunos_situacao")
+    lista = filtrar_por_situacao(db.query(Aluno).options(joinedload(Aluno.responsavel)), situacao
+                                 ).order_by(Aluno.ativo.desc(), Aluno.nome).all()
     if lista:
         st.dataframe(pd.DataFrame([{
-            "ID": a.id, "Aluno": a.nome, "Nascimento": para_str_br(a.data_nascimento),
+            "ID": a.id, "Aluno": a.nome, "Situação": "Ativo" if a.ativo else "Inativo",
+            "Nascimento": para_str_br(a.data_nascimento),
             "Idade": calcular_idade(a.data_nascimento), "Escolaridade": a.escolaridade or "-",
             "Responsável": a.responsavel.nome if a.responsavel else "-",
         } for a in lista]), width="stretch", hide_index=True)
     else:
-        st.info("Nenhum aluno ativo cadastrado.")
+        st.info("Nenhum aluno com essa situação.")
 
 
-def tela_cadastros(db):
+SITUACOES_ALUNO = ["Ativos", "Inativos", "Todos"]
+
+
+def rotulo_aluno(a):
+    return f"{a.id} — {a.nome}{'' if a.ativo else ' (inativo)'}"
+
+
+def filtrar_por_situacao(consulta, situacao):
+    if situacao == "Ativos":
+        return consulta.filter(Aluno.ativo == 1)
+    if situacao == "Inativos":
+        return consulta.filter(Aluno.ativo != 1)
+    return consulta
+
+
+def contagem_por_aluno(db, coluna_aluno):
+    """{aluno_id: quantidade} em uma única consulta agrupada."""
+    return dict(db.query(coluna_aluno, func.count()).group_by(coluna_aluno).all())
+
+
+def ultima_data_por_aluno(db, coluna_aluno, coluna_data):
+    return dict(db.query(coluna_aluno, func.max(coluna_data)).group_by(coluna_aluno).all())
+
+
+def tela_consulta_alunos(db, perfil):
+    """Consulta de alunos ativos E inativos. O histórico é preservado: inativar nunca apaga dados."""
+    f1, f2, f3 = st.columns([1.4, 2, 1.6])
+    situacao = f1.radio("Situação", SITUACOES_ALUNO, horizontal=True, key="consulta_alunos_situacao")
+    busca = f2.text_input("Buscar por nome do aluno ou do responsável", key="consulta_alunos_busca").strip()
+    consulta = db.query(Aluno).options(joinedload(Aluno.responsavel))
+    alunos = filtrar_por_situacao(consulta, situacao).order_by(Aluno.ativo.desc(), Aluno.nome).all()
+    if busca:
+        termo = normalizar_texto(busca)
+        alunos = [a for a in alunos if termo in normalizar_texto(a.nome)
+                  or (a.responsavel and termo in normalizar_texto(a.responsavel.nome))]
+    total_ativos = db.query(func.count(Aluno.id)).filter(Aluno.ativo == 1).scalar() or 0
+    total_inativos = db.query(func.count(Aluno.id)).filter(Aluno.ativo != 1).scalar() or 0
+    f3.metric("Ativos · Inativos", f"{total_ativos} · {total_inativos}")
+    if not alunos:
+        st.info("Nenhum aluno encontrado com esses filtros.")
+        return
+
+    clinico = perfil in ("Admin", "Profissional")   # LGPD: perfil Financeiro não vê contagens clínicas
+    contratos = {}
+    for c in db.query(Contrato).order_by(Contrato.id).all():
+        if c.status == "Ativo" or c.aluno_id not in contratos:
+            contratos[c.aluno_id] = c
+    lanc = contagem_por_aluno(db, LancamentoFinanceiro.aluno_id)
+    if clinico:
+        pront = contagem_por_aluno(db, Prontuario.aluno_id)
+        ativ = contagem_por_aluno(db, AtividadeAluno.aluno_id)
+        docs = contagem_por_aluno(db, DocumentoAluno.aluno_id)
+        ultimas = [ultima_data_por_aluno(db, Prontuario.aluno_id, Prontuario.data_registro),
+                   ultima_data_por_aluno(db, AtividadeAluno.aluno_id, AtividadeAluno.data_atividade),
+                   ultima_data_por_aluno(db, DocumentoAluno.aluno_id, DocumentoAluno.criado_em)]
+    linhas = []
+    for a in alunos:
+        c = contratos.get(a.id)
+        linha = {
+            "ID": a.id, "Aluno": a.nome, "Situação": "Ativo" if a.ativo else "Inativo",
+            "Nascimento": para_str_br(a.data_nascimento), "Idade": calcular_idade(a.data_nascimento),
+            "Escolaridade": a.escolaridade or "-", "Responsável": a.responsavel.nome if a.responsavel else "-",
+            "Telefone": (a.responsavel.telefone if a.responsavel else "") or "-",
+            "Contrato": f"{c.descricao_servico or '-'} · {moeda(c.valor_mensalidade)} ({c.status})" if c else "-",
+            "Lançamentos": lanc.get(a.id, 0),
+        }
+        if clinico:
+            datas = [d.get(a.id) for d in ultimas if d.get(a.id)]
+            linha.update({"Prontuários": pront.get(a.id, 0), "Atividades": ativ.get(a.id, 0),
+                          "Caderno": docs.get(a.id, 0),
+                          "Último registro": para_str_br(max(datas)) if datas else "-"})
+        linhas.append(linha)
+    tabela = pd.DataFrame(linhas)
+    st.caption(f"{len(tabela)} aluno(s). Inativar um aluno **não apaga nada**: contratos, prontuários, atividades, "
+               "caderno e lançamentos continuam guardados e podem ser consultados nas telas de cada módulo.")
+    st.dataframe(tabela, width="stretch", hide_index=True)
+    st.download_button("⬇️ Exportar esta lista (CSV)", data=tabela.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"alunos_{situacao.lower()}.csv", mime="text/csv", key="consulta_alunos_csv")
+
+
+def tela_cadastros(db, perfil="Admin"):
     st.title("Alunos e responsáveis")
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "➕ Cadastrar responsável", "➕ Cadastrar aluno", "✏️ Gerenciar alunos", "👥 Gerenciar responsáveis"
+    tab0, tab1, tab2, tab3, tab4 = st.tabs([
+        "🔎 Consultar alunos", "➕ Cadastrar responsável", "➕ Cadastrar aluno", "✏️ Gerenciar alunos",
+        "👥 Gerenciar responsáveis"
     ])
+    with tab0:
+        tela_consulta_alunos(db, perfil)
 
     with tab1:
         with st.form("f_resp", clear_on_submit=True):
@@ -2031,13 +2119,17 @@ def tela_contratos(db):
 
 def tela_prontuario(db):
     st.title("Prontuários e evolução")
-    alunos = db.query(Aluno).filter_by(ativo=1).order_by(Aluno.nome).all()
+    incluir_inativos = st.checkbox("Incluir alunos inativos (consultar histórico)", key="prontuario_inativos")
+    consulta = db.query(Aluno).order_by(Aluno.ativo.desc(), Aluno.nome)
+    alunos = consulta.all() if incluir_inativos else consulta.filter(Aluno.ativo == 1).all()
     if not alunos:
         st.info("Cadastre um aluno ativo antes de registrar uma evolução.")
         return
-    mapa = {f"{a.id} — {a.nome}": a.id for a in alunos}
+    mapa = {rotulo_aluno(a): a.id for a in alunos}
     aluno_label = st.selectbox("Aluno", list(mapa), key="prontuario_aluno")
     aluno_id = mapa[aluno_label]
+    if aluno_label.endswith("(inativo)"):
+        st.info("Aluno inativo: o histórico está preservado para consulta.")
     tab1, tab2 = st.tabs(["➕ Nova evolução", "📚 Consultar e editar histórico"])
     with tab1:
         with st.form("f_prontuario_novo", clear_on_submit=True):
@@ -3209,7 +3301,7 @@ def renderizar_analise_desempenho(df_aluno, indicadores, nome_aluno, prefixo, pu
 
 
 def _analise_interna(alunos, link_planilha):
-    mapa = {f"{a.id} — {a.nome}": a for a in alunos}
+    mapa = {rotulo_aluno(a): a for a in alunos}
     selecionado = st.selectbox("Aluno para análise", list(mapa), key="desempenho_aluno")
     aluno = mapa[selecionado]
     if st.button("🔄 Atualizar dados da planilha"):
@@ -3356,18 +3448,26 @@ def tela_desempenho(db, usuario):
                     carregar_planilha_observacao_atendimento.clear()
                     st.success("Configuração salva.")
                     st.rerun()
-    alunos = db.query(Aluno).filter_by(ativo=1).order_by(Aluno.nome).all()
-    if not alunos:
+    todos = db.query(Aluno).order_by(Aluno.ativo.desc(), Aluno.nome).all()
+    alunos = [a for a in todos if a.ativo]   # links para famílias: só alunos ativos
+    if not todos:
         st.info("Cadastre alunos antes de consultar indicadores.")
         return
     tab_analise, tab_links = st.tabs(["📊 Análise por aluno", "🔗 Links para as famílias"])
     with tab_analise:
-        if link_atual:
-            _analise_interna(alunos, link_atual)
+        incluir = st.checkbox("Incluir alunos inativos", key="desempenho_inativos")
+        lista = todos if incluir else alunos
+        if not lista:
+            st.info("Não há alunos ativos. Marque “Incluir alunos inativos” para consultar o histórico.")
+        elif link_atual:
+            _analise_interna(lista, link_atual)
         else:
             st.info("Configure a planilha mestre para consultar os indicadores.")
     with tab_links:
-        tela_links_familiares(db, usuario, alunos)
+        if alunos:
+            tela_links_familiares(db, usuario, alunos)
+        else:
+            st.info("Links para as famílias só podem ser gerados para alunos ativos.")
 
 
 MAX_PAGINAS_VISUALIZACAO = 15
@@ -4248,7 +4348,7 @@ def main():
         cabecalho(logo, cfg)
         telas = {
             "📊 Painel": lambda: tela_painel(db, usuario.perfil),
-            "👥 Alunos e responsáveis": lambda: tela_cadastros(db),
+            "👥 Alunos e responsáveis": lambda: tela_cadastros(db, usuario.perfil),
             "📄 Contratos": lambda: tela_contratos(db),
             "📂 Prontuários": lambda: tela_prontuario(db),
             "📁 Atividades": lambda: tela_atividades(db, usuario),

@@ -96,6 +96,12 @@ Menu e acesso definidos em `MENU_PAGINAS` e `PERMISSOES`:
   - receita por serviço e por aluno, despesas por categoria, previsto × recebido e inadimplência;
   - exportação em Excel (openpyxl), uma aba por seção.
 
+## Alunos inativos (21/11/2026)
+
+- Inativar nunca apaga dados. Alunos e responsáveis → 🔎 Consultar alunos (`tela_consulta_alunos`) filtra Ativos / Inativos / Todos e busca por aluno ou responsável. Mostra o contrato, a contagem de lançamentos e, só para Admin e Profissional (LGPD), prontuários, atividades, caderno e último registro. Exporta em CSV.
+- O Painel tem o filtro de situação e mostra a métrica de inativos. Prontuários e Desempenho (análise) têm a opção "Incluir alunos inativos". As telas de criação (novo contrato, nova atividade, atividade com caneta, links da família) continuam só com alunos ativos.
+- Funções auxiliares: `SITUACOES_ALUNO`, `filtrar_por_situacao`, `rotulo_aluno` (sufixo "(inativo)").
+
 ## Pendências / próximos passos
 
 1. Testar o portal da família localmente (gerar link → "Abrir o portal (testar)").
