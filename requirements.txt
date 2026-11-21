@@ -5,3 +5,5 @@ plotly
 psycopg[binary]
 reportlab
 pypdf
+pypdfium2
+pillow

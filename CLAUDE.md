@@ -51,6 +51,21 @@ Menu e acesso definidos em `MENU_PAGINAS` e `PERMISSOES`:
 - `painel_storage(usuario, prefixo)`: diagnóstico do Supabase Storage + botão para criar o bucket privado. Usado pela Guarda documental e pelos Materiais.
 - 📁 Atividades → 📎 Materiais em PDF: tabela `materiais_pedagogicos`. Importa vários PDFs (Atividade / Material escolar / Avaliação), para um aluno ou o acervo geral (`aluno_id` NULL), e pode criar uma atividade planejada por arquivo. O texto é extraído com pypdf para a busca, sem `\x00`, que o Postgres recusa. Biblioteca com filtros, busca dentro do PDF, link temporário, edição, vínculo a uma atividade e arquivamento. Arquivos ficam em `materiais/...` no mesmo bucket.
 
+## Caderno Digital (antiga Guarda documental)
+
+- Menu "📓 Caderno Digital" (`tela_caderno_digital`), mesma tabela `documentos_alunos` e mesmo bucket. Abas: Adicionar ao caderno, Consultar e compartilhar, Como alimentar (`DICAS_CADERNO`).
+- Colunas aditivas (`MIGRACOES_ADITIVAS`): `visivel_familia` (padrão 0: documentos antigos ficam privados), `mensagem_familia` (texto para os pais; `descricao` é anotação interna), `compartilhado_em`, `visualizacoes_familia`.
+- Portal (`renderizar_caderno_portal`): mostra só registros do aluno do link, ativos e com `visivel_familia = 1`. O link do PDF é gerado só no clique e soma uma visualização. `CATEGORIAS_SENSIVEIS` (laudo, contrato, autorização, comprovante) só são compartilhadas com confirmação explícita.
+
+## ✍️ Atividade com caneta (folhas interativas, modo atendimento)
+
+- Fluxo: atividade pronta (Canva/Word/Excel exportada em PDF) importada em 📎 Materiais em PDF → "Começar a preencher" → o aluno escreve com mesa digitalizadora/caneta/dedo → "Concluir" gera um PDF (fundo + tinta) que vai para o Caderno Digital, privado por padrão.
+- Componente próprio em `componentes/caderno_canvas/index.html` (`components.v1.declare_component`, protocolo postMessage sem build). Usa Pointer Events com pressão; o botão-borracha da caneta apaga; opção "Só caneta" ignora o toque da mão. Desfazer/refazer, marca-texto, salvamento automático 700 ms após cada traço. O componente só reinicia quando muda `chave` (folha-página).
+- Tabelas: `folhas_interativas` (material, aluno, status Em andamento/Concluída/Cancelada, documento_id do PDF final) e `folhas_paginas` (tinta PNG base64 por página, no banco, porque o bucket aceita só PDF).
+- Páginas renderizadas com pypdfium2 a 1100 px (`imagem_pagina`, em cache); PDF final montado com Pillow no tamanho físico original.
+- Não alterar `st.session_state["modo_aluno"]` depois do toggle: o Streamlit proíbe (o toggle some sozinho quando a folha fecha).
+- Ideia futura: tarefas de casa pelo portal da família usando o mesmo componente.
+
 ## Pendências / próximos passos
 
 1. Testar o portal da família localmente (gerar link → "Abrir o portal (testar)").

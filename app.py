@@ -21,7 +21,7 @@ import plotly.express as px
 import streamlit as st
 
 from sqlalchemy import (
-    Column, Date, DateTime, Float, ForeignKey, Integer, String, Text,
+    Column, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint,
     create_engine, func, inspect, or_, text as sql_text
 )
 from sqlalchemy.engine import URL
@@ -248,6 +248,11 @@ class DocumentoAluno(Base):
     status = Column(String(20), nullable=False, default="Ativo")
     criado_em = Column(Date, nullable=False, default=date.today)
     criado_por = Column(String(100), nullable=True)
+    # Caderno Digital (migração aditiva). Só aparece no portal com visivel_familia = 1.
+    visivel_familia = Column(Integer, nullable=False, default=0, server_default="0")
+    mensagem_familia = Column(Text, nullable=True)  # texto para os pais; a "descricao" é interna
+    compartilhado_em = Column(DateTime, nullable=True)
+    visualizacoes_familia = Column(Integer, nullable=False, default=0, server_default="0")
     aluno = relationship("Aluno")
 
 
@@ -318,6 +323,35 @@ class MaterialPedagogico(Base):
     criado_por = Column(String(100), nullable=True)
     aluno = relationship("Aluno")
     atividade = relationship("AtividadeAluno")
+
+
+class FolhaInterativa(Base):
+    """Uma aplicação de um material em PDF a um aluno, preenchida com caneta no atendimento."""
+    __tablename__ = "folhas_interativas"
+    id = Column(Integer, primary_key=True)
+    material_id = Column(Integer, ForeignKey("materiais_pedagogicos.id"), nullable=False, index=True)
+    aluno_id = Column(Integer, ForeignKey("alunos.id"), nullable=False, index=True)
+    titulo = Column(String(180), nullable=False)
+    status = Column(String(20), nullable=False, default="Em andamento")  # Em andamento / Concluída / Cancelada
+    total_paginas = Column(Integer, nullable=False, default=1)
+    criado_em = Column(DateTime, nullable=False, default=datetime.now)
+    atualizado_em = Column(DateTime, nullable=True)
+    concluido_em = Column(DateTime, nullable=True)
+    criado_por = Column(String(100), nullable=True)
+    documento_id = Column(Integer, ForeignKey("documentos_alunos.id"), nullable=True)  # PDF final no Caderno
+    material = relationship("MaterialPedagogico")
+    aluno = relationship("Aluno")
+
+
+class FolhaPagina(Base):
+    """Tinta de uma página (PNG transparente em base64), separada do fundo do PDF original."""
+    __tablename__ = "folhas_paginas"
+    __table_args__ = (UniqueConstraint("folha_id", "pagina", name="uq_folha_pagina"),)
+    id = Column(Integer, primary_key=True)
+    folha_id = Column(Integer, ForeignKey("folhas_interativas.id"), nullable=False, index=True)
+    pagina = Column(Integer, nullable=False)
+    tinta_png = Column(Text, nullable=True)
+    atualizado_em = Column(DateTime, nullable=True)
 
 
 class LogAuditoria(Base):
@@ -395,25 +429,35 @@ def backup_sqlite_automatico():
 # Executada UMA vez por processo (cache_resource), e não a cada clique.
 # ============================================================
 
-def aplicar_migracoes_aditivas():
-    """Adiciona somente colunas ausentes; nunca remove/reescreve dados existentes."""
-    colunas_novas = {
+MIGRACOES_ADITIVAS = {
+    "atividades_alunos": {
         "area": "VARCHAR(100)",
         "objetivo": "TEXT",
         "data_prazo": "DATE",
         "resultado": "TEXT",
         "observacoes": "TEXT",
-    }
+    },
+    # Caderno Digital: documentos existentes ficam PRIVADOS (visivel_familia = 0).
+    "documentos_alunos": {
+        "visivel_familia": "INTEGER NOT NULL DEFAULT 0",
+        "mensagem_familia": "TEXT",
+        "compartilhado_em": "TIMESTAMP",
+        "visualizacoes_familia": "INTEGER NOT NULL DEFAULT 0",
+    },
+}
+
+
+def aplicar_migracoes_aditivas():
+    """Adiciona somente colunas ausentes; nunca remove/reescreve dados existentes."""
     inspetor = inspect(engine)
-    if not inspetor.has_table("atividades_alunos"):
-        return
-    existentes = {c["name"] for c in inspetor.get_columns("atividades_alunos")}
-    for nome, tipo_sql in colunas_novas.items():
-        if nome not in existentes:
-            with engine.begin() as conexao:
-                conexao.execute(sql_text(
-                    f'ALTER TABLE atividades_alunos ADD COLUMN "{nome}" {tipo_sql}'
-                ))
+    for tabela, colunas_novas in MIGRACOES_ADITIVAS.items():
+        if not inspetor.has_table(tabela):
+            continue  # tabela nova: create_all já cria com todas as colunas
+        existentes = {c["name"] for c in inspetor.get_columns(tabela)}
+        for nome, tipo_sql in colunas_novas.items():
+            if nome not in existentes:
+                with engine.begin() as conexao:
+                    conexao.execute(sql_text(f'ALTER TABLE {tabela} ADD COLUMN "{nome}" {tipo_sql}'))
 
 
 @st.cache_resource(show_spinner="Preparando o banco de dados...")
@@ -565,7 +609,7 @@ def carregar_configuracoes(db):
 # --------------------------- PERMISSÕES ----------------------
 MENU_PAGINAS = [
     "📊 Painel", "👥 Alunos e responsáveis", "📄 Contratos",
-    "📂 Prontuários", "📁 Atividades", "🗄️ Guarda documental",
+    "📂 Prontuários", "📁 Atividades", "✍️ Atividade com caneta", "📓 Caderno Digital",
     "💰 Financeiro", "📈 Desempenho", "👤 Usuários", "⚙️ Configurações",
 ]
 
@@ -575,7 +619,7 @@ PERMISSOES = {
     "Admin": set(MENU_PAGINAS),
     "Profissional": {
         "📊 Painel", "👥 Alunos e responsáveis", "📂 Prontuários", "📁 Atividades",
-        "🗄️ Guarda documental", "📈 Desempenho",
+        "✍️ Atividade com caneta", "📓 Caderno Digital", "📈 Desempenho",
     },
     "Financeiro": {
         "📊 Painel", "👥 Alunos e responsáveis", "📄 Contratos", "💰 Financeiro",
@@ -1132,6 +1176,125 @@ def importar_material_pdf(db, conteudo, nome_arquivo, dados, usuario_nome):
         raise
     aviso = None if texto else f"{nome_arquivo}: importado, mas sem texto pesquisável (PDF escaneado/imagem)."
     return material, aviso
+
+
+# --------------------------- FOLHAS COM CANETA ---------------
+LARGURA_FOLHA_PX = 1100      # resolução da página na tela (≈ 133 dpi em A4)
+MAX_PAGINAS_FOLHA = 40
+
+import streamlit.components.v1 as _componentes
+_componente_canvas = _componentes.declare_component(
+    "caderno_canvas", path=str(BASE_DIR / "componentes" / "caderno_canvas"))
+
+
+def baixar_pdf_storage(caminho):
+    """Baixa um arquivo privado do bucket (credencial só no servidor)."""
+    cfg = obter_config_storage()
+    if not cfg:
+        raise RuntimeError("Storage não configurado.")
+    url = (f"{cfg['url']}/storage/v1/object/{urllib.parse.quote(cfg['bucket'], safe='')}/"
+           f"{urllib.parse.quote(caminho, safe='/')}")
+    headers = {"apikey": cfg["key"]}
+    if tipo_chave_supabase(cfg["key"]).startswith("jwt"):
+        headers["Authorization"] = f"Bearer {cfg['key']}"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as resposta:
+            return resposta.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Supabase Storage retornou HTTP {exc.code} ao baixar o arquivo") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Falha de comunicação com Supabase Storage: {exc.reason}") from exc
+
+
+@st.cache_data(ttl=3600, max_entries=16, show_spinner=False)
+def pdf_do_material(caminho, sha256):
+    """PDF original do material (o sha256 na chave invalida o cache se o arquivo mudar)."""
+    return baixar_pdf_storage(caminho)
+
+
+def contar_paginas_pdf(conteudo):
+    import pypdfium2 as pdfium
+    documento = pdfium.PdfDocument(conteudo)
+    try:
+        return len(documento)
+    finally:
+        documento.close()
+
+
+@st.cache_data(ttl=3600, max_entries=120, show_spinner=False)
+def imagem_pagina(caminho, sha256, pagina, largura=LARGURA_FOLHA_PX):
+    """Renderiza a página (1..n) como JPEG. Retorna (bytes_jpeg, largura, altura)."""
+    import pypdfium2 as pdfium
+    from io import BytesIO
+    documento = pdfium.PdfDocument(pdf_do_material(caminho, sha256))
+    try:
+        pag = documento[pagina - 1]
+        largura_pt, _ = pag.get_size()
+        imagem = pag.render(scale=largura / largura_pt).to_pil().convert("RGB")
+    finally:
+        documento.close()
+    buffer = BytesIO()
+    imagem.save(buffer, format="JPEG", quality=85, optimize=True)
+    return buffer.getvalue(), imagem.width, imagem.height
+
+
+def data_url(conteudo, mime):
+    import base64
+    return f"data:{mime};base64," + base64.b64encode(conteudo).decode("ascii")
+
+
+def png_de_data_url(valor):
+    """Valida e decodifica o PNG enviado pelo componente (nunca confia no navegador)."""
+    import base64
+    prefixo = "data:image/png;base64,"
+    if not isinstance(valor, str) or not valor.startswith(prefixo):
+        return None
+    bruto = base64.b64decode(valor[len(prefixo):], validate=True)
+    if not bruto.startswith(b"\x89PNG\r\n\x1a\n") or len(bruto) > 8 * 1024 * 1024:
+        return None
+    return bruto
+
+
+def salvar_tinta_pagina(db, folha, pagina, png_bytes):
+    """Grava (ou apaga, se vazia) a tinta da página. png_bytes=None significa página limpa."""
+    import base64
+    registro = db.query(FolhaPagina).filter_by(folha_id=folha.id, pagina=pagina).first()
+    if registro is None:
+        registro = FolhaPagina(folha_id=folha.id, pagina=pagina)
+        db.add(registro)
+    registro.tinta_png = base64.b64encode(png_bytes).decode("ascii") if png_bytes else None
+    registro.atualizado_em = datetime.now()
+    folha.atualizado_em = datetime.now()
+    db.commit()
+
+
+def gerar_pdf_folha(db, folha):
+    """PDF final: cada página do original com a escrita do aluno por cima."""
+    import base64
+    from io import BytesIO
+    from PIL import Image
+    tintas = {p.pagina: p.tinta_png for p in db.query(FolhaPagina).filter_by(folha_id=folha.id).all()}
+    paginas = []
+    for n in range(1, folha.total_paginas + 1):
+        jpeg, _, _ = imagem_pagina(folha.material.caminho_storage, folha.material.sha256, n)
+        fundo = Image.open(BytesIO(jpeg)).convert("RGBA")
+        if tintas.get(n):
+            tinta = Image.open(BytesIO(base64.b64decode(tintas[n]))).convert("RGBA")
+            if tinta.size != fundo.size:
+                tinta = tinta.resize(fundo.size)
+            fundo = Image.alpha_composite(fundo, tinta)
+        paginas.append(fundo.convert("RGB"))
+    import pypdfium2 as pdfium
+    original = pdfium.PdfDocument(pdf_do_material(folha.material.caminho_storage, folha.material.sha256))
+    try:
+        largura_pt = original[0].get_size()[0]
+    finally:
+        original.close()
+    # DPI que faz a página final ter o mesmo tamanho físico do original.
+    dpi = LARGURA_FOLHA_PX / (largura_pt / 72.0)
+    saida = BytesIO()
+    paginas[0].save(saida, format="PDF", save_all=True, append_images=paginas[1:], resolution=dpi)
+    return saida.getvalue()
 
 
 def formatar_tamanho(bytes_total):
@@ -1980,6 +2143,214 @@ def tela_materiais_pdf(db, usuario, alunos, categorias):
             st.caption(f"Arquivo original: {mat.nome_original} · SHA-256 {mat.sha256[:16]}…")
 
 
+def iniciar_folha(db, material, aluno_id, usuario_nome):
+    total = contar_paginas_pdf(pdf_do_material(material.caminho_storage, material.sha256))
+    if total > MAX_PAGINAS_FOLHA:
+        raise ValueError(f"O PDF tem {total} páginas; o limite para preencher com caneta é {MAX_PAGINAS_FOLHA}.")
+    folha = FolhaInterativa(material_id=material.id, aluno_id=aluno_id, titulo=material.titulo[:180],
+                            status="Em andamento", total_paginas=total, criado_em=datetime.now(),
+                            atualizado_em=datetime.now(), criado_por=usuario_nome)
+    db.add(folha)
+    db.commit()
+    return folha
+
+
+def concluir_folha(db, folha, compartilhar, mensagem, usuario_nome):
+    """Gera o PDF final, envia ao Storage e registra no Caderno Digital."""
+    conteudo = gerar_pdf_folha(db, folha)
+    caminho = f"alunos/{folha.aluno_id}/folha_{folha.id}_{uuid.uuid4().hex[:8]}.pdf"
+    enviar_pdf_storage(caminho, conteudo)
+    try:
+        categoria = "Avaliação" if folha.material and folha.material.tipo == "Avaliação" else "Atividade realizada"
+        documento = DocumentoAluno(
+            aluno_id=folha.aluno_id, titulo=folha.titulo, categoria=categoria,
+            descricao=f"Preenchida com caneta no atendimento (folha #{folha.id}).",
+            nome_original=f"{titulo_pelo_arquivo(folha.titulo)[:150]}.pdf", caminho_storage=caminho,
+            mime_type="application/pdf", tamanho_bytes=len(conteudo), sha256=hashlib.sha256(conteudo).hexdigest(),
+            status="Ativo", criado_em=date.today(), criado_por=usuario_nome,
+            visivel_familia=1 if compartilhar else 0, mensagem_familia=(mensagem or "").strip(),
+            compartilhado_em=datetime.now() if compartilhar else None, visualizacoes_familia=0,
+        )
+        db.add(documento)
+        db.flush()
+        folha.documento_id = documento.id
+        folha.status = "Concluída"
+        folha.concluido_em = datetime.now()
+        db.commit()
+    except Exception:
+        db.rollback()
+        try:
+            excluir_objeto_storage(caminho)
+        except Exception as limpeza_exc:
+            print(f"[AVISO] Falha ao limpar arquivo órfão: {limpeza_exc}")
+        raise
+    return documento
+
+
+def tela_atividade_caneta(db, usuario):
+    if usuario.perfil not in ("Admin", "Profissional"):
+        st.error("Acesso restrito aos perfis Admin e Profissional.")
+        return
+    folha_id = st.session_state.get("folha_aberta")
+    folha = db.get(FolhaInterativa, folha_id) if folha_id else None
+    if folha and folha.status == "Em andamento":
+        _tela_folha_aberta(db, usuario, folha)
+        return
+    st.session_state.pop("folha_aberta", None)
+
+    st.title("✍️ Atividade com caneta")
+    st.caption("O aluno preenche a atividade pronta (Canva, Word, Excel exportados em PDF) com a mesa "
+               "digitalizadora, caneta ou o dedo. Ao concluir, o resultado vai para o 📓 Caderno Digital.")
+    if not painel_storage(usuario, "storage_caneta"):
+        return
+    alunos = db.query(Aluno).filter_by(ativo=1).order_by(Aluno.nome).all()
+    if not alunos:
+        st.info("Cadastre um aluno ativo primeiro.")
+        return
+    mapa = {f"{a.id} — {a.nome}": a.id for a in alunos}
+    aluno_id = mapa[st.selectbox("Aluno", list(mapa), key="caneta_aluno")]
+
+    em_andamento = (db.query(FolhaInterativa).filter_by(aluno_id=aluno_id, status="Em andamento")
+                    .order_by(FolhaInterativa.atualizado_em.desc()).all())
+    if em_andamento:
+        st.subheader("Continuar de onde parou")
+        for f in em_andamento:
+            c1, c2, c3 = st.columns([4, 1.3, 1.3])
+            c1.markdown(f"**{html.escape(f.titulo)}** · {f.total_paginas} pág. · "
+                        f"última alteração {formatar_data_hora(f.atualizado_em)}")
+            if c2.button("▶️ Abrir", key=f"abrir_folha_{f.id}", width="stretch", type="primary"):
+                st.session_state["folha_aberta"] = f.id
+                st.session_state["folha_pagina"] = 1
+                st.rerun()
+            if c3.button("Cancelar", key=f"cancelar_folha_{f.id}", width="stretch"):
+                try:
+                    f.status = "Cancelada"
+                    db.commit()
+                except SQLAlchemyError as exc:
+                    db.rollback()
+                    mensagem_erro(exc, "cancelamento da folha")
+                else:
+                    registrar_auditoria("folha_cancelada", f"folha_id={f.id}", usuario.nome)
+                    st.rerun()
+
+    st.subheader("Nova atividade")
+    M = MaterialPedagogico
+    materiais = (db.query(M).filter(M.status == "Ativo", or_(M.aluno_id.is_(None), M.aluno_id == aluno_id))
+                 .order_by(M.criado_em.desc()).limit(300).all())
+    if not materiais:
+        st.info("Nenhum PDF disponível. Importe a atividade em 📁 Atividades → 📎 Materiais em PDF "
+                "(no Canva, Word ou Excel use **Exportar/Salvar como PDF**).")
+    else:
+        opcoes = {f"{m.titulo} — {m.tipo}{'' if m.aluno_id else ' (acervo geral)'}"
+                  f"{f' · {m.paginas} pág.' if m.paginas else ''}": m.id for m in materiais}
+        escolha = st.selectbox("Atividade ou avaliação", list(opcoes), key="caneta_material")
+        if st.button("✍️ Começar a preencher", type="primary", key="caneta_comecar"):
+            try:
+                with st.spinner("Preparando as páginas…"):
+                    folha_nova = iniciar_folha(db, db.get(M, opcoes[escolha]), aluno_id, usuario.nome)
+            except ValueError as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                db.rollback()
+                mensagem_erro(exc, "preparação da folha")
+            else:
+                registrar_auditoria("folha_iniciada", f"folha_id={folha_nova.id}; material_id={folha_nova.material_id}",
+                                    usuario.nome)
+                st.session_state["folha_aberta"] = folha_nova.id
+                st.session_state["folha_pagina"] = 1
+                st.rerun()
+
+    concluidas = (db.query(FolhaInterativa).filter_by(aluno_id=aluno_id, status="Concluída")
+                  .order_by(FolhaInterativa.concluido_em.desc()).limit(50).all())
+    if concluidas:
+        with st.expander(f"✅ Concluídas ({len(concluidas)})"):
+            st.dataframe(pd.DataFrame([{
+                "Atividade": f.titulo, "Páginas": f.total_paginas, "Concluída em": formatar_data_hora(f.concluido_em),
+                "No caderno": f"#{f.documento_id}" if f.documento_id else "-",
+            } for f in concluidas]), width="stretch", hide_index=True)
+            st.caption("O PDF preenchido está no 📓 Caderno Digital, onde você decide se a família vê.")
+
+
+def _tela_folha_aberta(db, usuario, folha):
+    modo_aluno = st.toggle("🖥️ Modo aluno (esconde menus)", key="modo_aluno")
+    if modo_aluno:
+        st.markdown("<style>[data-testid='stSidebar'],[data-testid='stSidebarCollapsedControl'],header,"
+                    "div[data-testid='stMarkdown']:has(.ed-header){display:none !important;}"
+                    ".block-container{padding-top:.6rem !important;max-width:100% !important;}</style>",
+                    unsafe_allow_html=True)
+    total = folha.total_paginas
+    pagina = min(max(int(st.session_state.get("folha_pagina", 1)), 1), total)
+
+    c_tit, c_ant, c_pag, c_prox = st.columns([5, 1, 1.4, 1])
+    c_tit.markdown(f"### {html.escape(folha.titulo)}  \n<span style='color:#64748b'>{html.escape(folha.aluno.nome)}</span>",
+                   unsafe_allow_html=True)
+    if c_ant.button("◀", key="folha_ant", disabled=pagina <= 1, width="stretch"):
+        st.session_state["folha_pagina"] = pagina - 1
+        st.rerun()
+    c_pag.markdown(f"<div style='text-align:center;padding-top:.45rem'><b>Página {pagina} de {total}</b></div>",
+                   unsafe_allow_html=True)
+    if c_prox.button("▶", key="folha_prox", disabled=pagina >= total, width="stretch"):
+        st.session_state["folha_pagina"] = pagina + 1
+        st.rerun()
+
+    try:
+        jpeg, largura, altura = imagem_pagina(folha.material.caminho_storage, folha.material.sha256, pagina)
+    except Exception as exc:
+        mensagem_erro(exc, "abertura da página")
+        if st.button("Voltar"):
+            st.session_state.pop("folha_aberta", None)
+            st.rerun()
+        return
+    registro = db.query(FolhaPagina).filter_by(folha_id=folha.id, pagina=pagina).first()
+    tinta = f"data:image/png;base64,{registro.tinta_png}" if registro and registro.tinta_png else ""
+    chave = f"{folha.id}-{pagina}"
+    valor = _componente_canvas(fundo=data_url(jpeg, "image/jpeg"), tinta=tinta, largura=largura, altura=altura,
+                               chave=chave, so_caneta=bool(st.session_state.get("so_caneta_padrao", False)),
+                               key=f"canvas_{chave}", default=None)
+
+    # O componente envia a página inteira após cada traço; grava só versões novas desta página.
+    if isinstance(valor, dict) and valor.get("chave") == chave:
+        marca = (valor.get("sessao"), valor.get("versao"))
+        if st.session_state.get(f"tinta_salva_{chave}") != marca:
+            png = None if valor.get("vazio") else png_de_data_url(valor.get("png"))
+            if png is None and not valor.get("vazio"):
+                st.warning("A escrita recebida não é válida e não foi salva.")
+            else:
+                try:
+                    salvar_tinta_pagina(db, folha, pagina, png)
+                except SQLAlchemyError as exc:
+                    db.rollback()
+                    mensagem_erro(exc, "gravação da escrita")
+                else:
+                    st.session_state[f"tinta_salva_{chave}"] = marca
+
+    st.divider()
+    b1, b2 = st.columns([1, 2])
+    if b1.button("⏸️ Fechar e continuar depois", key="folha_fechar", width="stretch"):
+        st.session_state.pop("folha_aberta", None)
+        st.rerun()
+    with b2.expander("✅ Concluir atividade"):
+        with st.form(f"f_concluir_folha_{folha.id}"):
+            compartilhar = st.checkbox("👪 Mostrar no portal da família", value=False)
+            mensagem = st.text_area("Mensagem para a família (opcional)")
+            concluir = st.form_submit_button("Concluir e guardar no Caderno Digital", type="primary")
+        if concluir:
+            try:
+                with st.spinner("Gerando o PDF com a escrita do aluno…"):
+                    documento = concluir_folha(db, folha, compartilhar, mensagem, usuario.nome)
+            except Exception as exc:
+                db.rollback()
+                mensagem_erro(exc, "conclusão da atividade")
+            else:
+                registrar_auditoria("folha_concluida", f"folha_id={folha.id}; documento_id={documento.id}; "
+                                    f"familia={int(compartilhar)}", usuario.nome)
+                st.session_state.pop("folha_aberta", None)
+                st.success("Atividade concluída e guardada no Caderno Digital.")
+                st.rerun()
+    st.caption("A escrita é salva sozinha alguns instantes após cada traço. Com a mesa digitalizadora, "
+               "marque **Só caneta** na barra para ignorar a mão apoiada na tela.")
+
+
 def tela_atividades(db, usuario):
     st.title("Atividades pedagógicas")
     st.caption("Planejamento, execução e acompanhamento individual das atividades.")
@@ -2130,7 +2501,7 @@ def tela_atividades(db, usuario):
 def painel_storage(usuario, prefixo="storage"):
     """Mostra a situação do Supabase Storage. Retorna True se os envios estão liberados.
 
-    Usado pela Guarda documental e pelos Materiais em PDF (mesmo bucket privado).
+    Usado pelo Caderno Digital e pelos Materiais em PDF (mesmo bucket privado).
     """
     cfg = obter_config_storage()
     if not cfg:
@@ -2171,9 +2542,19 @@ def painel_storage(usuario, prefixo="storage"):
     return True
 
 
-def tela_guarda_documental(db, usuario):
-    st.title("Guarda documental")
-    st.caption("Repositório privado de documentos PDF vinculados aos alunos.")
+CATEGORIAS_CADERNO = [
+    "Atividade realizada", "Produção do aluno", "Tarefa para casa", "Registro da sessão",
+    "Devolutiva / relatório", "Comunicado à família", "Avaliação", "Documento escolar",
+    "Laudo recebido", "Contrato e termos", "Autorização", "Comprovante", "Outros",
+]
+# Categorias sensíveis: só vão para a família com confirmação explícita na aba Consultar.
+CATEGORIAS_SENSIVEIS = {"Laudo recebido", "Contrato e termos", "Autorização", "Comprovante"}
+
+
+def tela_caderno_digital(db, usuario):
+    st.title("📓 Caderno Digital")
+    st.caption("O caderno do aluno: atividades, produções, tarefas e devolutivas em PDF. "
+               "Você escolhe o que a família vê no portal; o resto fica privado.")
     if usuario.perfil not in ("Admin", "Profissional"):
         st.error("Acesso restrito aos perfis Admin e Profissional.")
         return
@@ -2181,114 +2562,187 @@ def tela_guarda_documental(db, usuario):
         return
     alunos = db.query(Aluno).order_by(Aluno.nome).all()
     if not alunos:
-        st.info("Cadastre um aluno antes de arquivar documentos.")
+        st.info("Cadastre um aluno antes de alimentar o caderno.")
         return
     mapa = {f"{a.id} — {a.nome}{'' if a.ativo else ' (inativo)'}": a.id for a in alunos}
-    categorias = ["Contrato e termos", "Avaliação", "Relatório", "Laudo recebido", "Autorização", "Documento escolar", "Comprovante", "Outros"]
-    tab1, tab2 = st.tabs(["⬆️ Importar PDF", "🗂️ Consultar documentos"])
+    categorias = CATEGORIAS_CADERNO
+    tab1, tab2, tab3 = st.tabs(["⬆️ Adicionar ao caderno", "🗂️ Consultar e compartilhar", "💡 Como alimentar"])
     with tab1:
-        st.markdown("**Importação segura** · PDF até 20 MB · armazenamento privado na nuvem.")
+        st.markdown("**PDF até 20 MB** · armazenamento privado. Marque *Mostrar para a família* para aparecer no portal.")
         with st.form("f_upload_documento", clear_on_submit=True):
-            aluno_sel = st.selectbox("Vincular ao aluno", list(mapa))
-            titulo = st.text_input("Título do documento *")
-            categoria = st.selectbox("Categoria documental", categorias)
-            data_doc = st.date_input("Data do documento", value=date.today(), format="DD/MM/YYYY")
-            descricao = st.text_area("Descrição / observações")
-            arquivo = st.file_uploader("Selecione o arquivo PDF", type=["pdf"], accept_multiple_files=False)
-            enviar = st.form_submit_button("Enviar e arquivar PDF", type="primary")
+            c1, c2 = st.columns(2)
+            aluno_sel = c1.selectbox("Aluno", list(mapa))
+            categoria = c2.selectbox("Tipo de registro", categorias)
+            titulo = st.text_input("Título *", placeholder="ex.: Produção de texto — A viagem da Lua")
+            data_doc = st.date_input("Data", value=date.today(), format="DD/MM/YYYY")
+            arquivo = st.file_uploader("Arquivo PDF", type=["pdf"], accept_multiple_files=False)
+            compartilhar = st.checkbox("👪 Mostrar para a família no portal", value=False)
+            mensagem_fam = st.text_area("Mensagem para a família (aparece no portal)",
+                                        placeholder="ex.: Hoje a Ana organizou as ideias do texto com mais autonomia. "
+                                                    "Em casa, peça para ela recontar a história.")
+            descricao = st.text_area("Anotação interna (a família NÃO vê)")
+            enviar = st.form_submit_button("Adicionar ao caderno", type="primary")
         if enviar:
+            erro_pdf = validar_pdf(arquivo.getvalue()) if arquivo is not None else None
             if not titulo.strip() or arquivo is None:
                 st.error("Informe o título e selecione um arquivo PDF.")
+            elif erro_pdf:
+                st.error(f"O arquivo {erro_pdf}.")
+            elif compartilhar and categoria in CATEGORIAS_SENSIVEIS:
+                st.error(f"“{categoria}” é um documento sensível. Adicione sem compartilhar e, se quiser mesmo "
+                         "mostrar à família, use a aba 🗂️ Consultar e compartilhar, que pede confirmação.")
             else:
                 conteudo = arquivo.getvalue()
-                if len(conteudo) > LIMITE_PDF_BYTES:
-                    st.error("O arquivo excede o limite de 20 MB.")
-                elif not conteudo.startswith(b"%PDF-"):
-                    st.error("O arquivo selecionado não possui assinatura válida de PDF.")
+                digest = hashlib.sha256(conteudo).hexdigest()
+                duplicado = db.query(DocumentoAluno).filter_by(aluno_id=mapa[aluno_sel], sha256=digest, status="Ativo").first()
+                if duplicado:
+                    st.warning(f"Este mesmo arquivo já está no caderno como '{duplicado.titulo}' (#{duplicado.id}).")
                 else:
-                    digest = hashlib.sha256(conteudo).hexdigest()
-                    duplicado = db.query(DocumentoAluno).filter_by(aluno_id=mapa[aluno_sel], sha256=digest, status="Ativo").first()
-                    if duplicado:
-                        st.warning(f"Este mesmo arquivo já está arquivado como '{duplicado.titulo}' (documento #{duplicado.id}).")
+                    ext_nome = Path(arquivo.name).name[:180]
+                    caminho = f"alunos/{mapa[aluno_sel]}/{uuid.uuid4().hex}.pdf"
+                    enviado_storage = False
+                    try:
+                        enviar_pdf_storage(caminho, conteudo)
+                        enviado_storage = True
+                        documento = DocumentoAluno(
+                            aluno_id=mapa[aluno_sel], titulo=titulo.strip(), categoria=categoria,
+                            descricao=descricao.strip(), nome_original=ext_nome,
+                            caminho_storage=caminho, mime_type="application/pdf", tamanho_bytes=len(conteudo),
+                            sha256=digest, status="Ativo", criado_em=data_doc, criado_por=usuario.nome,
+                            visivel_familia=1 if compartilhar else 0, mensagem_familia=mensagem_fam.strip(),
+                            compartilhado_em=datetime.now() if compartilhar else None, visualizacoes_familia=0,
+                        )
+                        db.add(documento)
+                        db.commit()
+                    except Exception as exc:
+                        db.rollback()
+                        if enviado_storage:
+                            try:
+                                excluir_objeto_storage(caminho)
+                            except Exception as limpeza_exc:
+                                print(f"[AVISO] Falha ao limpar arquivo órfão: {limpeza_exc}")
+                        mensagem_erro(exc, "inclusão no caderno")
                     else:
-                        ext_nome = Path(arquivo.name).name[:180]
-                        caminho = f"alunos/{mapa[aluno_sel]}/{uuid.uuid4().hex}.pdf"
-                        enviado_storage = False
-                        try:
-                            enviar_pdf_storage(caminho, conteudo)
-                            enviado_storage = True
-                            documento = DocumentoAluno(
-                                aluno_id=mapa[aluno_sel], titulo=titulo.strip(), categoria=categoria,
-                                descricao=descricao.strip(), nome_original=ext_nome,
-                                caminho_storage=caminho, mime_type="application/pdf", tamanho_bytes=len(conteudo),
-                                sha256=digest, status="Ativo", criado_em=data_doc,
-                                criado_por=usuario.nome
-                            )
-                            db.add(documento)
-                            db.commit()
-                            st.success("PDF enviado e registrado na guarda documental.")
-                            st.rerun()
-                        except Exception as exc:
-                            db.rollback()
-                            if enviado_storage:
-                                try:
-                                    excluir_objeto_storage(caminho)
-                                except Exception as limpeza_exc:
-                                    print(f"[AVISO] Falha ao limpar arquivo órfão: {limpeza_exc}")
-                            mensagem_erro(exc, "importação do documento")
+                        registrar_auditoria("caderno_registro_incluido",
+                                            f"documento_id={documento.id}; familia={int(compartilhar)}", usuario.nome)
+                        st.success("Registro adicionado ao caderno" +
+                                   (" e já visível no portal da família." if compartilhar else " (privado)."))
     with tab2:
         documentos = db.query(DocumentoAluno).order_by(DocumentoAluno.criado_em.desc(), DocumentoAluno.id.desc()).all()
-        filtro_aluno = st.selectbox("Filtrar aluno", ["Todos"] + list(mapa), key="docs_filtro_aluno")
-        filtro_categoria = st.selectbox("Categoria", ["Todas"] + categorias, key="docs_filtro_categoria")
-        incluir_arquivados = st.checkbox("Incluir documentos arquivados", value=False)
+        f1, f2, f3 = st.columns(3)
+        filtro_aluno = f1.selectbox("Aluno", ["Todos"] + list(mapa), key="docs_filtro_aluno")
+        filtro_categoria = f2.selectbox("Tipo", ["Todos"] + categorias, key="docs_filtro_categoria")
+        filtro_familia = f3.selectbox("Visibilidade", ["Todos", "Visíveis à família", "Privados"], key="docs_filtro_familia")
+        incluir_arquivados = st.checkbox("Incluir registros arquivados", value=False)
         filtrados = documentos
         if filtro_aluno != "Todos":
             filtrados = [d for d in filtrados if d.aluno_id == mapa[filtro_aluno]]
-        if filtro_categoria != "Todas":
+        if filtro_categoria != "Todos":
             filtrados = [d for d in filtrados if d.categoria == filtro_categoria]
+        if filtro_familia != "Todos":
+            quer = filtro_familia == "Visíveis à família"
+            filtrados = [d for d in filtrados if bool(d.visivel_familia) == quer]
         if not incluir_arquivados:
             filtrados = [d for d in filtrados if d.status == "Ativo"]
-        if filtrados:
-            st.dataframe(pd.DataFrame([{
-                "ID": d.id, "Aluno": d.aluno.nome if d.aluno else "-", "Título": d.titulo,
-                "Categoria": d.categoria, "Data": para_str_br(d.criado_em),
-                "Arquivo": d.nome_original, "Tamanho": formatar_tamanho(d.tamanho_bytes),
-                "Situação": d.status, "Incluído por": d.criado_por or "-"
-            } for d in filtrados]), width="stretch", hide_index=True)
-            opcoes = {f"#{d.id} — {d.aluno.nome if d.aluno else '-'} — {d.titulo} ({d.status})": d.id for d in filtrados}
-            selecionado = st.selectbox("Documento", list(opcoes), key="doc_selecionado")
-            doc = db.get(DocumentoAluno, opcoes[selecionado])
-            c1, c2 = st.columns(2)
-            with c1:
-                # O link só é gerado quando solicitado (antes era gerado a cada clique na tela).
-                chave_link = f"link_doc_{doc.id}"
-                if st.button("Gerar link temporário (10 min)", key=f"btn_{chave_link}", width="stretch"):
+        if not filtrados:
+            st.info("Nenhum registro encontrado com os filtros selecionados.")
+            return
+        st.dataframe(pd.DataFrame([{
+            "ID": d.id, "Aluno": d.aluno.nome if d.aluno else "-", "Data": para_str_br(d.criado_em),
+            "Tipo": d.categoria, "Título": d.titulo,
+            "Família vê": "👪 Sim" if d.visivel_familia else "🔒 Não",
+            "Aberto pela família": d.visualizacoes_familia or 0,
+            "Situação": d.status, "Incluído por": d.criado_por or "-",
+        } for d in filtrados]), width="stretch", hide_index=True)
+        opcoes = {f"#{d.id} — {d.aluno.nome if d.aluno else '-'} — {d.titulo} ({d.status})": d.id for d in filtrados}
+        selecionado = st.selectbox("Registro", list(opcoes), key="doc_selecionado")
+        doc = db.get(DocumentoAluno, opcoes[selecionado])
+        c1, c2 = st.columns(2)
+        with c1:
+            # O link só é gerado quando solicitado (antes era gerado a cada clique na tela).
+            chave_link = f"link_doc_{doc.id}"
+            if st.button("Gerar link temporário (10 min)", key=f"btn_{chave_link}", width="stretch"):
+                try:
+                    st.session_state[chave_link] = gerar_link_pdf(doc.caminho_storage)
+                    registrar_auditoria("documento_aberto", f"documento_id={doc.id}", usuario.nome)
+                except Exception as exc:
+                    mensagem_erro(exc, "geração do acesso ao PDF")
+            if st.session_state.get(chave_link):
+                st.link_button("📄 Abrir PDF", st.session_state[chave_link], width="stretch")
+        with c2:
+            if doc.status == "Ativo":
+                confirmar = st.checkbox("Confirmo o arquivamento deste registro", key=f"confirmar_arq_doc_{doc.id}")
+                if st.button("Arquivar registro", key=f"arquivar_doc_{doc.id}", disabled=not confirmar, width="stretch"):
                     try:
-                        st.session_state[chave_link] = gerar_link_pdf(doc.caminho_storage)
-                        registrar_auditoria("documento_aberto", f"documento_id={doc.id}", usuario.nome)
-                    except Exception as exc:
-                        mensagem_erro(exc, "geração do acesso ao PDF")
-                if st.session_state.get(chave_link):
-                    st.link_button("Abrir PDF", st.session_state[chave_link], width="stretch")
-            with c2:
-                if doc.status == "Ativo":
-                    confirmar = st.checkbox("Confirmo o arquivamento deste documento", key=f"confirmar_arq_doc_{doc.id}")
-                    if st.button("Arquivar documento", key=f"arquivar_doc_{doc.id}", disabled=not confirmar):
                         doc.status = "Arquivado"
-                        try:
-                            db.commit()
-                            st.success("Documento arquivado. O arquivo original foi preservado no Storage.")
-                            st.rerun()
-                        except SQLAlchemyError as exc:
-                            db.rollback()
-                            mensagem_erro(exc, "arquivamento do documento")
-            with st.expander("Detalhes do documento"):
-                st.write("**Descrição:**", doc.descricao or "Não informada")
-                st.write("**SHA-256:**", doc.sha256)
-                st.write("**Tamanho:**", formatar_tamanho(doc.tamanho_bytes))
-                st.write("**Caminho interno:**", doc.caminho_storage)
+                        doc.visivel_familia = 0  # arquivado sai do portal
+                        db.commit()
+                    except SQLAlchemyError as exc:
+                        db.rollback()
+                        mensagem_erro(exc, "arquivamento do registro")
+                    else:
+                        registrar_auditoria("caderno_registro_arquivado", f"documento_id={doc.id}", usuario.nome)
+                        st.rerun()
+
+        st.markdown("##### 👪 Compartilhamento com a família")
+        if doc.status != "Ativo":
+            st.info("Registros arquivados não aparecem no portal.")
         else:
-            st.info("Nenhum documento encontrado com os filtros selecionados.")
+            sensivel = doc.categoria in CATEGORIAS_SENSIVEIS
+            with st.form(f"f_compartilhar_{doc.id}"):
+                visivel = st.checkbox("Mostrar este registro no portal da família", value=bool(doc.visivel_familia))
+                msg = st.text_area("Mensagem para a família", value=doc.mensagem_familia or "")
+                conf_sensivel = (st.checkbox(f"Confirmo que a família deve ver este documento sensível ({doc.categoria}).")
+                                 if sensivel else True)
+                salvar_comp = st.form_submit_button("Salvar compartilhamento", type="primary")
+            if salvar_comp:
+                if visivel and sensivel and not conf_sensivel:
+                    st.error("Marque a confirmação para compartilhar um documento sensível.")
+                else:
+                    passou_a_compartilhar = visivel and not doc.visivel_familia
+                    try:
+                        doc.visivel_familia = 1 if visivel else 0
+                        doc.mensagem_familia = msg.strip()
+                        if passou_a_compartilhar:
+                            doc.compartilhado_em = datetime.now()
+                        db.commit()
+                    except SQLAlchemyError as exc:
+                        db.rollback()
+                        mensagem_erro(exc, "compartilhamento do registro")
+                    else:
+                        registrar_auditoria("caderno_compartilhamento",
+                                            f"documento_id={doc.id}; familia={int(visivel)}", usuario.nome)
+                        st.rerun()
+            if doc.visivel_familia:
+                st.caption(f"Visível desde {formatar_data_hora(doc.compartilhado_em) if doc.compartilhado_em else '-'} · "
+                           f"aberto {doc.visualizacoes_familia or 0} vez(es) pela família.")
+        with st.expander("Detalhes do registro"):
+            st.write("**Anotação interna:**", doc.descricao or "Não informada")
+            st.write("**Arquivo original:**", doc.nome_original)
+            st.write("**Tamanho:**", formatar_tamanho(doc.tamanho_bytes))
+            st.write("**SHA-256:**", doc.sha256)
+    with tab3:
+        st.markdown(DICAS_CADERNO)
+
+
+DICAS_CADERNO = """
+**Rotina sugerida**
+- **Depois de cada atendimento (2 min):** 1 registro com a produção do aluno ou a atividade feita, com uma mensagem curta.
+- **Toda semana:** 1 *Tarefa para casa* com instrução clara para os pais (o que fazer, quanto tempo, como ajudar).
+- **Todo mês:** 1 *Devolutiva / relatório* com a evolução (combine com os indicadores de 📈 Desempenho).
+
+**Como transformar papel em PDF pelo celular**
+- Google Drive → **+ → Digitalizar**, ou o app de câmera/Notas do celular → "Digitalizar documento". Junte várias páginas num PDF só.
+
+**Mensagem para a família — modelo**
+> *O que fizemos:* … · *O que observei:* … (comece por um avanço) · *Em casa:* uma ação simples.
+
+**Boas práticas (LGPD)**
+- A família vê **só** o que tem 👪. Anotações internas, hipóteses e laudos ficam 🔒.
+- Laudos, contratos e comprovantes pedem confirmação extra para serem compartilhados.
+- Um registro por arquivo, com título que diga o conteúdo e a data correta da atividade.
+- Errou? Desmarque o compartilhamento ou arquive: sai do portal na hora.
+"""
 
 
 VALORES_VAZIOS = {"", "nan", "none", "-", "—", "não informado", "nao informado"}
@@ -2417,8 +2871,9 @@ def tela_links_familiares(db, usuario, alunos):
     local = eh_endereco_local(app_url)
     st.markdown(
         "Gere um **link individual** para a família acompanhar o desempenho, sem login. "
-        "A família vê somente: indicadores de participação, evolução, compreensão, dificuldades, "
-        "conteúdos trabalhados e atividades. **Prontuário, hipóteses, documentos e financeiro nunca aparecem.**"
+        "A família vê somente: o **📓 Caderno Digital** (apenas registros marcados com 👪), indicadores de "
+        "participação, evolução, compreensão, dificuldades, conteúdos trabalhados e atividades. "
+        "**Prontuário, hipóteses, anotações internas e financeiro nunca aparecem.**"
     )
     if not app_url:
         st.warning("Não foi possível identificar o endereço do sistema. Cadastre a URL pública em ⚙️ Configurações "
@@ -2545,6 +3000,46 @@ def tela_desempenho(db, usuario):
         tela_links_familiares(db, usuario, alunos)
 
 
+def renderizar_caderno_portal(db, link, aluno):
+    """Caderno Digital no portal: SOMENTE registros ativos marcados como visíveis à família."""
+    st.subheader("📓 Caderno Digital")
+    registros = (db.query(DocumentoAluno)
+                 .filter(DocumentoAluno.aluno_id == aluno.id, DocumentoAluno.status == "Ativo",
+                         DocumentoAluno.visivel_familia == 1)
+                 .order_by(DocumentoAluno.criado_em.desc(), DocumentoAluno.id.desc())
+                 .limit(100).all())
+    if not registros:
+        st.info("Ainda não há registros no caderno. Assim que a profissional compartilhar, eles aparecem aqui.")
+        return
+    storage_ok = obter_config_storage() is not None
+    categorias = sorted({r.categoria for r in registros})
+    filtro = st.selectbox("Mostrar", ["Tudo"] + categorias, key="portal_caderno_filtro") if len(categorias) > 1 else "Tudo"
+    for reg in registros:
+        if filtro != "Tudo" and reg.categoria != filtro:
+            continue
+        with st.container(border=True):
+            st.markdown(f"**{html.escape(reg.titulo)}**")
+            st.caption(f"{para_str_br(reg.criado_em)} · {reg.categoria}")
+            if reg.mensagem_familia:
+                st.markdown(html.escape(reg.mensagem_familia).replace("\n", "  \n"))
+            chave = f"portal_link_doc_{reg.id}"
+            if storage_ok and st.button("📄 Abrir PDF", key=f"btn_{chave}"):
+                try:
+                    st.session_state[chave] = gerar_link_pdf(reg.caminho_storage)
+                    reg.visualizacoes_familia = (reg.visualizacoes_familia or 0) + 1
+                    db.commit()
+                except SQLAlchemyError:
+                    db.rollback()
+                except Exception as exc:
+                    print(f"[ERRO] portal: link do documento {reg.id}: {exc}")
+                    st.warning("Não foi possível abrir o arquivo agora. Tente novamente em instantes.")
+                else:
+                    registrar_auditoria("portal_caderno_aberto", f"link_id={link.id}; documento_id={reg.id}",
+                                        usuario="Família")
+            if st.session_state.get(chave):
+                st.link_button("Abrir o arquivo (link válido por 10 minutos)", st.session_state[chave])
+
+
 def renderizar_portal_familiar(db, token, logo, cfg):
     """Página pública acessada pelo link individual (?portal=TOKEN), sem login."""
     aplicar_estilo_global()
@@ -2573,6 +3068,9 @@ def renderizar_portal_familiar(db, token, logo, cfg):
     st.title(f"Acompanhamento de {aluno.nome}")
     st.caption(f"Link pessoal válido até {para_str_br(link.expira_em)}. Por favor, não compartilhe.")
 
+    renderizar_caderno_portal(db, link, aluno)
+
+    st.subheader("📈 Desempenho nos atendimentos")
     link_planilha = obter_link_planilha(db)
     df = carregar_planilha_observacao_atendimento(link_planilha) if link_planilha else None
     df_aluno, indicadores = (filtrar_e_analisar_aluno(df, aluno.nome)
@@ -2961,7 +3459,8 @@ def main():
             "📄 Contratos": lambda: tela_contratos(db),
             "📂 Prontuários": lambda: tela_prontuario(db),
             "📁 Atividades": lambda: tela_atividades(db, usuario),
-            "🗄️ Guarda documental": lambda: tela_guarda_documental(db, usuario),
+            "✍️ Atividade com caneta": lambda: tela_atividade_caneta(db, usuario),
+            "📓 Caderno Digital": lambda: tela_caderno_digital(db, usuario),
             "💰 Financeiro": lambda: tela_financeiro(db),
             "📈 Desempenho": lambda: tela_desempenho(db, usuario),
             "👤 Usuários": lambda: tela_usuarios(db, usuario.perfil),

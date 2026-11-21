@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Folha interativa</title>
+<style>
+  :root { --borda:#d7dfea; --ink:#142b4a; --destaque:#087e8b; --fundo:#f4f7fb; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: transparent; font-family: "Source Sans Pro", Arial, sans-serif; color: var(--ink); }
+  .barra { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 8px; background: #fff;
+           border: 1px solid var(--borda); border-radius: 12px; margin-bottom: 8px; position: sticky; top: 0; z-index: 5; }
+  .grupo { display: flex; gap: 4px; align-items: center; padding-right: 8px; margin-right: 2px; border-right: 1px solid var(--borda); }
+  .grupo:last-child { border-right: 0; }
+  button { font: inherit; font-size: 15px; min-width: 40px; min-height: 40px; padding: 4px 10px; border-radius: 9px;
+           border: 1px solid var(--borda); background: #fff; color: var(--ink); cursor: pointer; }
+  button:hover { border-color: var(--destaque); }
+  button.ativo { background: var(--ink); color: #fff; border-color: var(--ink); }
+  .cor { width: 32px; min-width: 32px; height: 32px; min-height: 32px; padding: 0; border-radius: 50%; border: 3px solid #fff;
+         box-shadow: 0 0 0 1px var(--borda); }
+  .cor.ativo { box-shadow: 0 0 0 3px var(--destaque); background-clip: padding-box; }
+  .status { margin-left: auto; font-size: 14px; color: #64748b; white-space: nowrap; }
+  .status.ok { color: #15803d; } .status.pendente { color: #b45309; }
+  .folha { position: relative; width: 100%; background: #fff; border-radius: 6px; box-shadow: 0 4px 18px rgba(20,43,74,.12);
+           overflow: hidden; }
+  .folha img, .folha canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+  .folha img { user-select: none; -webkit-user-drag: none; pointer-events: none; }
+  canvas#tinta { touch-action: none; cursor: crosshair; }
+  label.toque { display: flex; gap: 6px; align-items: center; font-size: 14px; cursor: pointer; }
+</style>
+</head>
+<body>
+<div class="barra" id="barra">
+  <div class="grupo" id="ferramentas">
+    <button data-ferramenta="caneta" class="ativo" title="Caneta">✏️</button>
+    <button data-ferramenta="marca" title="Marca-texto">🖍️</button>
+    <button data-ferramenta="borracha" title="Borracha">🧽</button>
+  </div>
+  <div class="grupo" id="cores"></div>
+  <div class="grupo" id="espessuras">
+    <button data-esp="2" title="Fina">•</button>
+    <button data-esp="4" class="ativo" title="Média">●</button>
+    <button data-esp="8" title="Grossa">⬤</button>
+  </div>
+  <div class="grupo">
+    <button id="desfazer" title="Desfazer">↶</button>
+    <button id="refazer" title="Refazer">↷</button>
+    <button id="limpar" title="Limpar a página">🗑️</button>
+  </div>
+  <div class="grupo">
+    <label class="toque" title="Com caneta/mesa digitalizadora, ignora a mão apoiada na tela">
+      <input type="checkbox" id="soCaneta"> Só caneta
+    </label>
+  </div>
+  <span class="status" id="status">Pronto</span>
+</div>
+<div class="folha" id="folha">
+  <img id="fundo" alt="Página da atividade">
+  <canvas id="tinta"></canvas>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  // ---------- Protocolo de componentes do Streamlit (v1), sem dependências ----------
+  function enviar(tipo, dados) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: tipo }, dados || {}), "*");
+  }
+  function ajustarAltura() { enviar("streamlit:setFrameHeight", { height: document.documentElement.scrollHeight + 4 }); }
+
+  const CORES = ["#111827", "#1d4ed8", "#dc2626", "#15803d", "#7c3aed"];
+  const fundo = document.getElementById("fundo");
+  const canvas = document.getElementById("tinta");
+  const folha = document.getElementById("folha");
+  const statusEl = document.getElementById("status");
+  const ctx = canvas.getContext("2d");
+
+  let chaveAtual = null;      // muda só quando abre outra folha/página
+  let base = null;            // tinta já salva (imagem), desenhada por baixo dos traços desta sessão
+  let tracos = [];            // traços desta sessão (vetoriais) para desfazer/refazer
+  let desfeitos = [];
+  let tracoAtual = null;
+  let ferramenta = "caneta", cor = CORES[0], espessura = 4;
+  let versao = 0, timerSalvar = null, limpouBase = false;
+  const sessao = Math.random().toString(36).slice(2);
+
+  // ---------- Barra de ferramentas ----------
+  const coresEl = document.getElementById("cores");
+  CORES.forEach(function (c, i) {
+    const b = document.createElement("button");
+    b.className = "cor" + (i === 0 ? " ativo" : ""); b.style.background = c; b.title = "Cor";
+    b.onclick = function () { cor = c; marcar(coresEl, b); if (ferramenta === "borracha") escolherFerramenta("caneta"); };
+    coresEl.appendChild(b);
+  });
+  function marcar(grupo, botao) { grupo.querySelectorAll("button").forEach(function (x) { x.classList.toggle("ativo", x === botao); }); }
+  function escolherFerramenta(f) {
+    ferramenta = f;
+    marcar(document.getElementById("ferramentas"), document.querySelector('[data-ferramenta="' + f + '"]'));
+  }
+  document.querySelectorAll("[data-ferramenta]").forEach(function (b) { b.onclick = function () { escolherFerramenta(b.dataset.ferramenta); }; });
+  document.querySelectorAll("[data-esp]").forEach(function (b) {
+    b.onclick = function () { espessura = Number(b.dataset.esp); marcar(document.getElementById("espessuras"), b); };
+  });
+  document.getElementById("desfazer").onclick = function () { if (tracos.length) { desfeitos.push(tracos.pop()); redesenhar(); agendarSalvar(); } };
+  document.getElementById("refazer").onclick = function () { if (desfeitos.length) { tracos.push(desfeitos.pop()); redesenhar(); agendarSalvar(); } };
+  document.getElementById("limpar").onclick = function () {
+    if (!confirm("Apagar tudo o que foi escrito nesta página?")) return;
+    base = null; limpouBase = true; tracos = []; desfeitos = []; redesenhar(); agendarSalvar(true);
+  };
+  const soCaneta = document.getElementById("soCaneta");
+
+  // ---------- Desenho ----------
+  function larguraDo(traco, pressao) {
+    const fator = traco.ferramenta === "marca" ? 4 : traco.ferramenta === "borracha" ? 5 : 1;
+    // Mesa digitalizadora/caneta envia pressão (0..1); mouse envia 0 ou 0.5.
+    const p = traco.comPressao ? Math.max(0.15, pressao) : 0.5;
+    return traco.espessura * fator * (0.45 + 1.1 * p);
+  }
+  function estilo(traco) {
+    ctx.globalCompositeOperation = traco.ferramenta === "borracha" ? "destination-out" : "source-over";
+    ctx.strokeStyle = traco.ferramenta === "marca" ? hexAlpha(traco.cor, 0.32) : traco.cor;
+    ctx.lineCap = "round"; ctx.lineJoin = "round";
+  }
+  function hexAlpha(hex, a) {
+    const n = parseInt(hex.slice(1), 16);
+    return "rgba(" + (n >> 16 & 255) + "," + (n >> 8 & 255) + "," + (n & 255) + "," + a + ")";
+  }
+  function segmento(traco, a, b) {
+    estilo(traco);
+    ctx.lineWidth = larguraDo(traco, (a[2] + b[2]) / 2);
+    ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
+  }
+  function desenharTraco(traco) {
+    const pts = traco.pontos;
+    if (pts.length === 1) { segmento(traco, pts[0], [pts[0][0] + 0.01, pts[0][1], pts[0][2]]); return; }
+    for (let i = 1; i < pts.length; i++) segmento(traco, pts[i - 1], pts[i]);
+  }
+  function redesenhar() {
+    ctx.globalCompositeOperation = "source-over";
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (base) ctx.drawImage(base, 0, 0, canvas.width, canvas.height);
+    tracos.forEach(desenharTraco);
+    ctx.globalCompositeOperation = "source-over";
+  }
+  function ponto(ev) {
+    const r = canvas.getBoundingClientRect();
+    return [(ev.clientX - r.left) * canvas.width / r.width, (ev.clientY - r.top) * canvas.height / r.height,
+            ev.pressure || 0];
+  }
+  function aceita(ev) { return !(soCaneta.checked && ev.pointerType === "touch"); }
+
+  canvas.addEventListener("pointerdown", function (ev) {
+    if (!aceita(ev) || (ev.pointerType === "mouse" && ev.button !== 0)) return;
+    ev.preventDefault();
+    canvas.setPointerCapture(ev.pointerId);
+    // Botão traseiro da caneta (borracha da caneta) apaga.
+    const borrachaDaCaneta = ev.pointerType === "pen" && (ev.button === 5 || (ev.buttons & 32));
+    tracoAtual = { ferramenta: borrachaDaCaneta ? "borracha" : ferramenta, cor: cor, espessura: espessura,
+                   comPressao: ev.pointerType === "pen" && ev.pressure > 0, pontos: [ponto(ev)], id: ev.pointerId };
+    desfeitos = [];
+    desenharTraco(tracoAtual);
+    status("Escrevendo…", "pendente");
+  });
+  canvas.addEventListener("pointermove", function (ev) {
+    if (!tracoAtual || ev.pointerId !== tracoAtual.id) return;
+    ev.preventDefault();
+    const eventos = ev.getCoalescedEvents ? ev.getCoalescedEvents() : [ev];
+    (eventos.length ? eventos : [ev]).forEach(function (e) {
+      const p = ponto(e), ant = tracoAtual.pontos[tracoAtual.pontos.length - 1];
+      if (Math.abs(p[0] - ant[0]) + Math.abs(p[1] - ant[1]) < 0.6) return;
+      tracoAtual.pontos.push(p); segmento(tracoAtual, ant, p);
+    });
+  });
+  function finalizar(ev) {
+    if (!tracoAtual || ev.pointerId !== tracoAtual.id) return;
+    tracos.push(tracoAtual); tracoAtual = null;
+    ctx.globalCompositeOperation = "source-over";
+    agendarSalvar();
+  }
+  canvas.addEventListener("pointerup", finalizar);
+  canvas.addEventListener("pointercancel", finalizar);
+  canvas.addEventListener("contextmenu", function (ev) { ev.preventDefault(); });
+
+  // ---------- Salvamento automático ----------
+  function status(texto, classe) { statusEl.textContent = texto; statusEl.className = "status " + (classe || ""); }
+  function vazio() {
+    const d = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    for (let i = 3; i < d.length; i += 4) if (d[i]) return false;
+    return true;
+  }
+  function agendarSalvar(imediato) {
+    status("Salvando…", "pendente");
+    clearTimeout(timerSalvar);
+    timerSalvar = setTimeout(salvar, imediato ? 0 : 700);
+  }
+  function salvar() {
+    versao += 1;
+    const estaVazio = vazio();
+    enviar("streamlit:setComponentValue", {
+      dataType: "json",
+      value: { sessao: sessao, versao: versao, chave: chaveAtual, vazio: estaVazio,
+               png: estaVazio ? "" : canvas.toDataURL("image/png"), limpou: limpouBase },
+    });
+    status("Salvo ✓", "ok");
+  }
+
+  // ---------- Recebe a página do Python ----------
+  window.addEventListener("message", function (ev) {
+    const msg = ev.data || {};
+    if (msg.type !== "streamlit:render") return;
+    const a = msg.args || {};
+    if (a.chave === chaveAtual) return;           // mesma página: não reinicia (preserva o que está sendo escrito)
+    chaveAtual = a.chave; tracos = []; desfeitos = []; base = null; versao = 0; limpouBase = false;
+    soCaneta.checked = !!a.so_caneta;
+    canvas.width = a.largura; canvas.height = a.altura;
+    folha.style.aspectRatio = a.largura + " / " + a.altura;
+    fundo.onload = function () { ajustarAltura(); };
+    fundo.src = a.fundo;
+    if (a.tinta) {
+      const img = new Image();
+      img.onload = function () { base = img; redesenhar(); };
+      img.src = a.tinta;
+    } else { redesenhar(); }
+    status(a.tinta ? "Página carregada (com escrita salva)" : "Página em branco", "");
+    ajustarAltura();
+  });
+  window.addEventListener("resize", ajustarAltura);
+  enviar("streamlit:componentReady", { apiVersion: 1 });
+})();
+</script>
+</body>
+</html>
