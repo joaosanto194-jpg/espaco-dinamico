@@ -1,0 +1,4 @@
+# Configuração do Streamlit (vai para o git; os segredos ficam em secrets.toml, fora do git).
+[server]
+# Mesmo limite que o sistema valida para PDFs (20 MB): o aviso do envio de arquivos fica coerente.
+maxUploadSize = 20

@@ -64,6 +64,8 @@ Menu e acesso definidos em `MENU_PAGINAS` e `PERMISSOES`:
 - Tabelas: `folhas_interativas` (material, aluno, status Em andamento/Concluída/Cancelada, documento_id do PDF final) e `folhas_paginas` (tinta PNG base64 por página, no banco, porque o bucket aceita só PDF).
 - Páginas renderizadas com pypdfium2 a 1100 px (`imagem_pagina`, em cache); PDF final montado com Pillow no tamanho físico original.
 - Não alterar `st.session_state["modo_aluno"]` depois do toggle: o Streamlit proíbe (o toggle some sozinho quando a folha fecha).
+- "✅ Concluir" (dois cliques) e "⏸️ Continuar depois" ficam DENTRO do componente e vão na mesma mensagem que a tinta mais recente (`acao` no valor). Python grava a tinta e só então executa a ação. Botões Python fora do componente perdiam o último traço (corrida com o salvamento automático de 700 ms). Barra com larguras fixas e status em linha própria, para os botões não se moverem.
+- Após concluir: `aviso_folha_concluida` mostra a confirmação, e "Ver no Caderno Digital" (callback `ir_para_caderno`) troca `menu_principal` e pré-seleciona o registro. Na lista "Continuar de onde parou" há "✅ Concluir agora".
 - Ideia futura: tarefas de casa pelo portal da família usando o mesmo componente.
 
 ## Pendências / próximos passos

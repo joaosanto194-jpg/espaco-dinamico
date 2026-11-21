@@ -19,13 +19,20 @@
   .cor { width: 32px; min-width: 32px; height: 32px; min-height: 32px; padding: 0; border-radius: 50%; border: 3px solid #fff;
          box-shadow: 0 0 0 1px var(--borda); }
   .cor.ativo { box-shadow: 0 0 0 3px var(--destaque); background-clip: padding-box; }
-  .status { margin-left: auto; font-size: 14px; color: #64748b; white-space: nowrap; }
+  /* Status em linha própria: mudar o texto nunca desloca os botões. */
+  .status { flex-basis: 100%; text-align: right; font-size: 13px; color: #64748b; white-space: nowrap;
+            min-height: 18px; margin-top: -2px; }
   .status.ok { color: #15803d; } .status.pendente { color: #b45309; }
   .folha { position: relative; width: 100%; background: #fff; border-radius: 6px; box-shadow: 0 4px 18px rgba(20,43,74,.12);
            overflow: hidden; }
   .folha img, .folha canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
   .folha img { user-select: none; -webkit-user-drag: none; pointer-events: none; }
   canvas#tinta { touch-action: none; cursor: crosshair; }
+  .acoes { margin-left: auto; display: flex; gap: 6px; }
+  button.concluir { background: #15803d; color: #fff; border-color: #15803d; font-weight: 700; width: 200px; }
+  button.concluir.confirmar, button.alerta { background: #b45309; border-color: #b45309; color: #fff; }
+  button.pausar { font-weight: 600; width: 170px; }
+  #limpar { width: 76px; }
   label.toque { display: flex; gap: 6px; align-items: center; font-size: 14px; cursor: pointer; }
 </style>
 </head>
@@ -51,6 +58,10 @@
     <label class="toque" title="Com caneta/mesa digitalizadora, ignora a mão apoiada na tela">
       <input type="checkbox" id="soCaneta"> Só caneta
     </label>
+  </div>
+  <div class="acoes" id="acoes">
+    <button class="pausar" id="pausar" title="Salva e fecha para continuar em outra hora">⏸️ Continuar depois</button>
+    <button class="concluir" id="concluir" title="Gera o PDF e guarda no Caderno Digital do aluno">✅ Concluir</button>
   </div>
   <span class="status" id="status">Pronto</span>
 </div>
@@ -103,10 +114,21 @@
   });
   document.getElementById("desfazer").onclick = function () { if (tracos.length) { desfeitos.push(tracos.pop()); redesenhar(); agendarSalvar(); } };
   document.getElementById("refazer").onclick = function () { if (desfeitos.length) { tracos.push(desfeitos.pop()); redesenhar(); agendarSalvar(); } };
-  document.getElementById("limpar").onclick = function () {
-    if (!confirm("Apagar tudo o que foi escrito nesta página?")) return;
+  // Confirmação em dois cliques: o 1º arma o botão por 4 s, o 2º executa.
+  function doisCliques(botao, textoConfirmar, classe, acao) {
+    let armado = null; const original = botao.innerHTML;
+    botao.onclick = function () {
+      if (armado) { clearTimeout(armado); armado = null; botao.innerHTML = original; botao.classList.remove(classe); acao(); return; }
+      botao.innerHTML = textoConfirmar; botao.classList.add(classe);
+      armado = setTimeout(function () { armado = null; botao.innerHTML = original; botao.classList.remove(classe); }, 4000);
+    };
+  }
+  doisCliques(document.getElementById("limpar"), "Apagar?", "alerta", function () {
     base = null; limpouBase = true; tracos = []; desfeitos = []; redesenhar(); agendarSalvar(true);
-  };
+  });
+  // A ação vai JUNTO com a escrita mais recente, numa única mensagem: nenhum traço fica de fora.
+  doisCliques(document.getElementById("concluir"), "Confirmar conclusão?", "confirmar", function () { salvar("concluir"); });
+  document.getElementById("pausar").onclick = function () { salvar("pausar"); };
   const soCaneta = document.getElementById("soCaneta");
 
   // ---------- Desenho ----------
@@ -191,17 +213,30 @@
   function agendarSalvar(imediato) {
     status("Salvando…", "pendente");
     clearTimeout(timerSalvar);
-    timerSalvar = setTimeout(salvar, imediato ? 0 : 700);
+    timerSalvar = setTimeout(function () { salvar(); }, imediato ? 0 : 700);
   }
-  function salvar() {
+  // Ao sair da folha (ex.: para clicar em "Concluir"), envia na hora o que estiver pendente.
+  function salvarPendente() {
+    if (timerSalvar === null) return;
+    salvar();
+  }
+  document.documentElement.addEventListener("pointerleave", salvarPendente);
+  window.addEventListener("blur", salvarPendente);
+  document.addEventListener("visibilitychange", function () { if (document.hidden) salvarPendente(); });
+
+  function salvar(acao) {
+    clearTimeout(timerSalvar);
+    timerSalvar = null;
     versao += 1;
     const estaVazio = vazio();
     enviar("streamlit:setComponentValue", {
       dataType: "json",
-      value: { sessao: sessao, versao: versao, chave: chaveAtual, vazio: estaVazio,
+      value: { sessao: sessao, versao: versao, chave: chaveAtual, vazio: estaVazio, acao: acao || "",
                png: estaVazio ? "" : canvas.toDataURL("image/png"), limpou: limpouBase },
     });
-    status("Salvo ✓", "ok");
+    if (acao === "concluir") status("Concluindo… gerando o PDF", "pendente");
+    else if (acao === "pausar") status("Salvando e fechando…", "pendente");
+    else status("Salvo ✓", "ok");
   }
 
   // ---------- Recebe a página do Python ----------

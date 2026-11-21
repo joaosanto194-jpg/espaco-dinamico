@@ -482,7 +482,8 @@ def limpar_cpf(cpf):
 SENHA_PADRAO_ADMIN = "admin123"
 PBKDF2_ITERACOES = 390_000
 PREFIXO_HASH = "pbkdf2_sha256$"
-CHAVES_SESSAO = ("usuario_id", "usuario_logado", "perfil_usuario", "trocar_senha_obrigatoria")
+CHAVES_SESSAO = ("usuario_id", "usuario_logado", "perfil_usuario", "trocar_senha_obrigatoria",
+                 "menu_principal", "folha_aberta", "aviso_folha_concluida")
 
 
 def gerar_hash_senha(senha):
@@ -2201,6 +2202,18 @@ def tela_atividade_caneta(db, usuario):
     st.title("✍️ Atividade com caneta")
     st.caption("O aluno preenche a atividade pronta (Canva, Word, Excel exportados em PDF) com a mesa "
                "digitalizadora, caneta ou o dedo. Ao concluir, o resultado vai para o 📓 Caderno Digital.")
+    aviso = st.session_state.get("aviso_folha_concluida")
+    if aviso:
+        with st.container(border=True):
+            st.success(f"✅ **{aviso['titulo']}** concluída e guardada no 📓 Caderno Digital de **{aviso['aluno']}** "
+                       f"(registro #{aviso['documento_id']}, " +
+                       ("visível para a família)." if aviso["familia"] else "privado — compartilhe quando quiser)."))
+            a1, a2 = st.columns(2)
+            a1.button("📓 Ver no Caderno Digital", type="primary", width="stretch", key="ver_no_caderno",
+                      on_click=ir_para_caderno, args=(aviso["aluno_id"], aviso["aluno"], aviso["documento_id"]))
+            if a2.button("Fechar aviso", width="stretch", key="fechar_aviso_folha"):
+                st.session_state.pop("aviso_folha_concluida", None)
+                st.rerun()
     if not painel_storage(usuario, "storage_caneta"):
         return
     alunos = db.query(Aluno).filter_by(ativo=1).order_by(Aluno.nome).all()
@@ -2215,14 +2228,18 @@ def tela_atividade_caneta(db, usuario):
     if em_andamento:
         st.subheader("Continuar de onde parou")
         for f in em_andamento:
-            c1, c2, c3 = st.columns([4, 1.3, 1.3])
+            c1, c2, c3, c4 = st.columns([3.6, 1.2, 1.6, 1.1])
             c1.markdown(f"**{html.escape(f.titulo)}** · {f.total_paginas} pág. · "
                         f"última alteração {formatar_data_hora(f.atualizado_em)}")
             if c2.button("▶️ Abrir", key=f"abrir_folha_{f.id}", width="stretch", type="primary"):
                 st.session_state["folha_aberta"] = f.id
                 st.session_state["folha_pagina"] = 1
                 st.rerun()
-            if c3.button("Cancelar", key=f"cancelar_folha_{f.id}", width="stretch"):
+            if c3.button("✅ Concluir agora", key=f"concluir_lista_{f.id}", width="stretch",
+                         help="Gera o PDF com o que já foi escrito e guarda no Caderno Digital (privado)."):
+                if executar_conclusao(db, usuario, f, False):
+                    st.rerun()
+            if c4.button("Cancelar", key=f"cancelar_folha_{f.id}", width="stretch"):
                 try:
                     f.status = "Cancelada"
                     db.commit()
@@ -2281,9 +2298,12 @@ def _tela_folha_aberta(db, usuario, folha):
     total = folha.total_paginas
     pagina = min(max(int(st.session_state.get("folha_pagina", 1)), 1), total)
 
-    c_tit, c_ant, c_pag, c_prox = st.columns([5, 1, 1.4, 1])
+    c_tit, c_ant, c_pag, c_prox, c_fam = st.columns([4, 0.8, 1.4, 0.8, 1.6])
     c_tit.markdown(f"### {html.escape(folha.titulo)}  \n<span style='color:#64748b'>{html.escape(folha.aluno.nome)}</span>",
                    unsafe_allow_html=True)
+    c_fam.checkbox("👪 Família vê", key=f"familia_ve_{folha.id}",
+                   help="Marque antes de concluir para o resultado aparecer no portal da família. "
+                        "Pode mudar depois no Caderno Digital.")
     if c_ant.button("◀", key="folha_ant", disabled=pagina <= 1, width="stretch"):
         st.session_state["folha_pagina"] = pagina - 1
         st.rerun()
@@ -2308,7 +2328,9 @@ def _tela_folha_aberta(db, usuario, folha):
                                chave=chave, so_caneta=bool(st.session_state.get("so_caneta_padrao", False)),
                                key=f"canvas_{chave}", default=None)
 
-    # O componente envia a página inteira após cada traço; grava só versões novas desta página.
+    # O componente envia a página inteira após cada traço (e junto com "Concluir"/"Continuar depois");
+    # grava só versões novas desta página e só então executa a ação: o último traço nunca fica de fora.
+    acao = ""
     if isinstance(valor, dict) and valor.get("chave") == chave:
         marca = (valor.get("sessao"), valor.get("versao"))
         if st.session_state.get(f"tinta_salva_{chave}") != marca:
@@ -2323,32 +2345,46 @@ def _tela_folha_aberta(db, usuario, folha):
                     mensagem_erro(exc, "gravação da escrita")
                 else:
                     st.session_state[f"tinta_salva_{chave}"] = marca
-
-    st.divider()
-    b1, b2 = st.columns([1, 2])
-    if b1.button("⏸️ Fechar e continuar depois", key="folha_fechar", width="stretch"):
+                    acao = valor.get("acao") or ""
+    if acao == "pausar":
         st.session_state.pop("folha_aberta", None)
         st.rerun()
-    with b2.expander("✅ Concluir atividade"):
-        with st.form(f"f_concluir_folha_{folha.id}"):
-            compartilhar = st.checkbox("👪 Mostrar no portal da família", value=False)
-            mensagem = st.text_area("Mensagem para a família (opcional)")
-            concluir = st.form_submit_button("Concluir e guardar no Caderno Digital", type="primary")
-        if concluir:
-            try:
-                with st.spinner("Gerando o PDF com a escrita do aluno…"):
-                    documento = concluir_folha(db, folha, compartilhar, mensagem, usuario.nome)
-            except Exception as exc:
-                db.rollback()
-                mensagem_erro(exc, "conclusão da atividade")
-            else:
-                registrar_auditoria("folha_concluida", f"folha_id={folha.id}; documento_id={documento.id}; "
-                                    f"familia={int(compartilhar)}", usuario.nome)
-                st.session_state.pop("folha_aberta", None)
-                st.success("Atividade concluída e guardada no Caderno Digital.")
-                st.rerun()
-    st.caption("A escrita é salva sozinha alguns instantes após cada traço. Com a mesa digitalizadora, "
-               "marque **Só caneta** na barra para ignorar a mão apoiada na tela.")
+    if acao == "concluir":
+        if executar_conclusao(db, usuario, folha, bool(st.session_state.get(f"familia_ve_{folha.id}"))):
+            st.rerun()
+
+    st.caption("Use **✅ Concluir** (dois cliques) na barra da folha para gerar o PDF e guardar no 📓 Caderno Digital "
+               "do aluno, ou **⏸️ Continuar depois** para terminar em outra hora. A escrita também é salva sozinha "
+               "após cada traço. Com a mesa digitalizadora, marque **Só caneta** para ignorar a mão apoiada na tela.")
+
+
+def executar_conclusao(db, usuario, folha, compartilhar):
+    """Conclui a folha, guarda o PDF no Caderno Digital do aluno e deixa um aviso para a próxima tela."""
+    try:
+        with st.spinner("Gerando o PDF com a escrita do aluno e guardando no Caderno Digital…"):
+            documento = concluir_folha(db, folha, compartilhar, "", usuario.nome)
+    except Exception as exc:
+        db.rollback()
+        mensagem_erro(exc, "conclusão da atividade")
+        registrar_auditoria("folha_conclusao_falhou",
+                            f"folha_id={folha.id}; erro={type(exc).__name__}: {str(exc)[:200]}", usuario.nome)
+        return False
+    registrar_auditoria("folha_concluida", f"folha_id={folha.id}; documento_id={documento.id}; "
+                        f"familia={int(compartilhar)}", usuario.nome)
+    st.session_state.pop("folha_aberta", None)
+    st.session_state["aviso_folha_concluida"] = {
+        "documento_id": documento.id, "titulo": folha.titulo, "aluno_id": folha.aluno_id,
+        "aluno": folha.aluno.nome if folha.aluno else "-", "familia": bool(compartilhar),
+    }
+    return True
+
+
+def ir_para_caderno(aluno_id, aluno_nome, documento_id):
+    """Callback: abre o Caderno Digital já filtrado no aluno e no registro recém-criado."""
+    st.session_state["menu_principal"] = "📓 Caderno Digital"
+    st.session_state["docs_filtro_aluno"] = f"{aluno_id} — {aluno_nome}"
+    st.session_state["caderno_destacar"] = documento_id
+    st.session_state.pop("aviso_folha_concluida", None)
 
 
 def tela_atividades(db, usuario):
@@ -2566,6 +2602,9 @@ def tela_caderno_digital(db, usuario):
         return
     mapa = {f"{a.id} — {a.nome}{'' if a.ativo else ' (inativo)'}": a.id for a in alunos}
     categorias = CATEGORIAS_CADERNO
+    if st.session_state.get("caderno_destacar"):
+        st.info(f"Atividade com caneta guardada como registro #{st.session_state['caderno_destacar']}. "
+                "Abra a aba **🗂️ Consultar e compartilhar**: ele já está selecionado.")
     tab1, tab2, tab3 = st.tabs(["⬆️ Adicionar ao caderno", "🗂️ Consultar e compartilhar", "💡 Como alimentar"])
     with tab1:
         st.markdown("**PDF até 20 MB** · armazenamento privado. Marque *Mostrar para a família* para aparecer no portal.")
@@ -2655,6 +2694,11 @@ def tela_caderno_digital(db, usuario):
             "Situação": d.status, "Incluído por": d.criado_por or "-",
         } for d in filtrados]), width="stretch", hide_index=True)
         opcoes = {f"#{d.id} — {d.aluno.nome if d.aluno else '-'} — {d.titulo} ({d.status})": d.id for d in filtrados}
+        destacar = st.session_state.pop("caderno_destacar", None)
+        if destacar:
+            rotulo = next((k for k, v in opcoes.items() if v == destacar), None)
+            if rotulo:
+                st.session_state["doc_selecionado"] = rotulo
         selecionado = st.selectbox("Registro", list(opcoes), key="doc_selecionado")
         doc = db.get(DocumentoAluno, opcoes[selecionado])
         c1, c2 = st.columns(2)
@@ -3443,7 +3487,10 @@ def main():
             st.markdown(f"## {cfg['nome_instituicao']}")
             st.caption(f"{cfg['profissional_responsavel']} · {cfg['titulo_profissional']}")
             st.divider()
-            pagina = st.radio("MENU PRINCIPAL", menu_opcoes, label_visibility="visible")
+            # Tela guardada que este perfil não pode ver (ex.: troca de usuário) volta para a primeira.
+            if st.session_state.get("menu_principal") not in menu_opcoes:
+                st.session_state.pop("menu_principal", None)
+            pagina = st.radio("MENU PRINCIPAL", menu_opcoes, label_visibility="visible", key="menu_principal")
             st.divider()
             st.write(f"Conectado: **{usuario.nome}**")
             st.caption(f"Perfil: {usuario.perfil}")
